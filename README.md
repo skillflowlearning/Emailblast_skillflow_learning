@@ -18,6 +18,8 @@ npm run dev
 
 Open http://localhost:3000. The home page redirects to `/services`.
 
+Development output is stored in `.next-dev`; production builds use `.next`. This keeps `npm run build` from overwriting files used by a running development server. Restart `npm run dev` after changing the Next.js configuration.
+
 ```sh
 npm run build
 npm start
