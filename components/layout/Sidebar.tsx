@@ -11,6 +11,7 @@ import {
   Zap,
 } from 'lucide-react';
 import { cn } from '@/lib/utils';
+import AccountPanel from './AccountPanel';
 
 const navItems = [
   { label: 'Services', href: '/services', icon: LayoutGrid },
@@ -54,6 +55,7 @@ export default function Sidebar() {
           );
         })}
       </nav>
+      <AccountPanel />
       <div className="p-4 border-t border-gray-100 dark:border-gray-800">
         <Link
           href="/admin"

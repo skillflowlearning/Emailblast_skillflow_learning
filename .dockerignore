@@ -1,0 +1,16 @@
+node_modules
+*firebase-adminsdk*.json
+client_secret*.json
+.next
+.next-dev
+.git
+.mailflow-local
+.env
+.env.*
+*.pem
+*.key
+*service-account*.json
+artifacts
+tests
+*.tsbuildinfo
+npm-debug.log*

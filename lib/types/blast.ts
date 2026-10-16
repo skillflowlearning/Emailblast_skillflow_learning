@@ -33,6 +33,9 @@ export interface BlastDomain {
   name: string;
   status: DomainStatus;
   flaggedMailboxCount: number;
+  pausedAt?: number;
+  cooldownUntil?: number;
+  lastControlAt?: number;
 }
 
 export type MailboxStatus = 'active' | 'paused' | 'cooldown' | 'spare';
@@ -64,6 +67,7 @@ export interface BlastMailbox {
   signalCheckAt?: number;
   recipientSendsSinceSeed?: number;
   pendingSeedProbes?: { email: string; token: string }[];
+  healthPassedAt?: number;
 }
 
 export type CampaignStatus =
@@ -165,6 +169,7 @@ export interface SendEmailParams {
   campaignId?: string;
   recipientId?: string;
   seedToken?: string;
+  rfcMessageId?: string;
   unsubscribeUrl?: string;
   listUnsubscribeHeader?: string;
   listUnsubscribePostHeader?: string;

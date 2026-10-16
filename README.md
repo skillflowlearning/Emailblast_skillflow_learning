@@ -1,70 +1,61 @@
 # MailFlow / Emailblast Skillflow Learning
 
-A Next.js application for email list cleaning, spam-risk checks, message templates, and email campaign workflows.
+Email Blast is the current focus: saved campaigns, paced Google Workspace sending, health checks and automatic reassignment of pending recipients. Cleaning, standalone spam scoring and AI templates remain prototypes.
 
-## Run locally
+## Local simulation
 
-Install Node.js and npm, then run:
+Requires Node.js 22 and npm. Copy `env.local.example` to `.env.local`; keep `BLAST_PROVIDER_MODE=simulation` and `BLAST_STORAGE=local`.
 
 ```sh
 npm ci
-```
-
-Copy `env.local.example` to `.env.local`. Keep `BLAST_PROVIDER_MODE=simulation` for development. The example Firebase values are placeholders; configure your own Firebase project for persistence.
-
-```sh
 npm run dev
 ```
 
-Open http://localhost:3000. The home page redirects to `/services`.
-
-Development output is stored in `.next-dev`; production builds use `.next`. This keeps `npm run build` from overwriting files used by a running development server. Restart `npm run dev` after changing the Next.js configuration.
+In a second terminal in the same project folder:
 
 ```sh
-npm run build
-npm start
+npm run worker
 ```
 
-## Features and routes
+Open [Email Blast](http://localhost:3000/app/blast). Campaigns save every imported recipient (up to 10,000 per campaign) in the ignored `.mailflow-local` folder. Reopen from [Campaigns](http://localhost:3000/campaigns). The worker continues with the browser closed; the computer and worker process must remain running. Use the same browser profile for your local session. Back up local data and its secret together. Local demo data does not automatically migrate to a cloud workspace.
 
-| Route | Purpose |
-| --- | --- |
-| `/services` | Service selection |
-| `/app/clean` | Email list upload, syntax checks, disposable-domain and role-account flags |
-| `/app/spam-check` | Rule-based subject and body analysis |
-| `/app/templates` | Professional, friendly, and direct message templates |
-| `/app/blast` | Five-step campaign setup and campaign monitoring |
-| `/campaigns` | Campaign management interface |
-| `/domains` | Domain management interface |
-| `/reports` | Reporting interface |
-| `/settings` | Settings and emergency sending controls |
-| `/admin` | Administration interface |
-| `/unsubscribe` | Recipient unsubscribe interface |
+Development uses `.next-dev`; production uses `.next`. This prevents builds from replacing a running dev server's generated chunks. If a missing generated module error persists, stop this project's servers, clear only its generated `.next-dev`/`.next` folders, and restart.
 
-The campaign engine includes mailbox capacity checks, recipient allocation, simulated bounce and seed signals, pause rules, and reassignment of pending recipients. Server routes provide batch processing (`/api/blast/worker`), test sends (`/api/blast/test-send`), and unsubscribe requests (`/api/unsubscribe`). Live provider code uses the Gmail API with an SMTP fallback through Nodemailer.
+## Google and hosting setup
 
-## Project structure
+- [GOOGLE_SETUP.md](GOOGLE_SETUP.md): domains, mailboxes, Firebase, OAuth and mandatory health checks.
+- [DEPLOYMENT.md](DEPLOYMENT.md): Firestore, Cloud Run, authenticated Cloud Tasks and Scheduler recovery.
+- [PROJECT_STATUS.md](PROJECT_STATUS.md): implementation and remaining launch work.
 
-- `app/`: App Router pages, layouts, and API routes.
-- `components/`: Campaign monitoring, navigation, and shared interface components.
-- `lib/config/`: Sending limits, provider mode, and demo mailbox configuration.
-- `lib/services/`: Campaign engine, mail providers, Firestore access, and email utilities.
-- `lib/types/`: Campaign, recipient, mailbox, domain, and provider types.
-- `public/` and `photos/`: Image assets.
-- `SETUP.md`: Google Workspace credentials and sending setup guide.
+Saved campaigns use each user's connected Google OAuth accounts. The legacy delegation/SMTP helper remains for compatibility; saved campaigns never use its fallback. No real credentials or cloud resources are included.
 
-Built with Next.js 15, React 19, TypeScript, Tailwind CSS, Radix UI, Firebase, Papa Parse, and Nodemailer.
+## Sending behavior
 
-## Current implementation notes
+- Mailbox daily cap 30, optional healthy-day ramp defaults to 15%, hard maximum 50. Seeds and health probes consume capacity.
+- Random 30–120 second gaps, batches of 10–15, then two minutes to check signals. Default 10am–6pm Asia/Kolkata. Simulation runs 60× faster.
+- Two spam placements among the latest three seed results pause the mailbox for 48h and put its domain on watch. Promotions is not spam.
+- Two distinct flagged mailboxes pause their domain for 72h. Only pending recipients transfer to healthy senders/spares; sent or uncertain deliveries never transfer.
+- Bounce rate above 3% after at least 50 sends pauses the mailbox. Failed signal checks cannot count as healthy.
+- Recovery requires a fresh passing probe after cooldown, explicit activation and starts at 8/day.
+- Protected live launch requires two different registered sending domains, healthy connected senders, a separate owned seed inbox and a healthy spare. Six mailboxes or subdomains under one registered domain cannot satisfy the two-domain requirement. A domain's mailboxes share its sending budget.
+- Replies and signed unsubscribe requests persist to the owner's suppression list. Emergency stop persists across restarts.
 
-This is a development and learning application. Email cleaning uses local rules rather than mailbox verification; spam scoring uses heuristics; template generation uses predefined copy. Several dashboard pages start with empty data and are not fully connected to persistent campaign records.
+## Server design and limits
 
-The sending engine now uses per-mailbox deadlines: one due operation per tick, 30–120 second gaps, 10–15 message batches, and a two-minute signal wait. Simulation uses a 60× clock and never sends real mail. Seed messages count toward mailbox capacity. Spam/bounce rules activate eligible spares, block paused domains, and leave overflow queued. Failed signal checks never count as successful inbox placement. A 48-hour cooldown blocks early mailbox recovery; explicit recovery starts at 8/day. Healthy daily rollover applies the configured ramp up to 50/day.
+`lib/server` owns authentication, campaign state, encrypted refresh tokens, leases, delivery attempts and scheduling. Local development uses atomic filesystem transactions; production requires Firestore transactions. Workspaces are isolated by authenticated Firebase owner. Browsers display progress and submit controls; a separate worker drives sending.
 
-Firestore persistence is conditional on configuration, and recipient persistence currently saves only the first 100 recipients per call. The worker runs when called by the browser; there is no independent background scheduler. Its kill switch, concurrency lock, and stale-request revisions are process-local. They do not provide durable or cross-instance idempotency. Campaigns and mailbox quotas must move to authenticated, authoritative server storage with transactional leases before a live deployment. Local suppression fallback is in memory and does not survive restarts. Outlook/Yahoo seed access is not implemented. Soft bounces are recorded for review rather than automatically re-sending an email already accepted by the provider.
+An attempt is saved before contacting Gmail. Uncertain outcomes are held to avoid automatic duplicates. Domains offers a Gmail Sent check using a saved RFC Message-ID. Only a positive match confirms acceptance; a missing result remains held for investigation. Exactly-once delivery and inbox placement are not guaranteed.
 
-For live seed checks, set `BLAST_SEED_EMAILS` to inboxes you own and can read using your Workspace delegation. Demo seed addresses are simulation-only. Personal Gmail, Outlook, and Yahoo inboxes need their own authorization integrations.
+Production jobs require Google-signed OIDC tokens for the configured service account. Tasks schedules the next operation; Scheduler recovers due work. Currently one unfinished live campaign is allowed per workspace, with an 8 MiB serialized storage limit. Archive/export UI and large-scale storage optimization remain pending.
 
-Run `npm test` for the engine and mocked Gmail-provider checks. See `PROJECT_STATUS.md` for completed work and the remaining launch steps.
+## Validation
 
-Keep credentials in `.env.local`, which is excluded from Git along with dependencies and generated build output. The example environment file is included so a new checkout can be configured.
+```sh
+npm test
+npx tsc --noEmit
+npm run build
+```
+
+Tests use simulation and mocked Google responses; they never send email. Google OAuth, cloud transactions and deployed scheduling require real-project integration testing. See security notes in `PROJECT_STATUS.md` before public deployment.
+
+Keep credentials in `.env.local` or the hosting secret store. Never commit passwords, keys, refresh tokens or local workspace data.

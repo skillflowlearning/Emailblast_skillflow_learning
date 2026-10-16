@@ -20,6 +20,20 @@ import { BLAST_CONFIG, hasLiveGoogleCredentials, hasLiveSmtpCredentials } from '
 
 // In-memory token cache for Google Service Account impersonation: mailboxEmail -> { token, expiresAt }
 const tokenCache = new Map<string, { token: string; expiresAt: number }>();
+const gmailFetch = (url: string, options: RequestInit = {}) => fetch(url, { ...options, signal: AbortSignal.timeout(15000) });
+
+async function listSignalMessages(token: string, query: string): Promise<{ id: string }[]> {
+  const messages: { id: string }[] = []; let pageToken: string | undefined;
+  for (let page = 0; page < 5; page++) {
+    const params = new URLSearchParams({ q: query, maxResults: '20', ...(pageToken ? { pageToken } : {}) });
+    const response = await gmailFetch(`https://gmail.googleapis.com/gmail/v1/users/me/messages?${params}`, { headers: { Authorization: `Bearer ${token}` } });
+    if (!response.ok) throw new Error('Signal message lookup failed.');
+    const data = await response.json() as { messages?: { id: string }[]; nextPageToken?: string };
+    messages.push(...(data.messages || [])); pageToken = data.nextPageToken;
+    if (!pageToken) return messages;
+  }
+  throw new Error('Signal backlog exceeds the scan limit. Review it before sending continues.');
+}
 
 interface GmailPart {
   body?: { data?: string };
@@ -77,7 +91,7 @@ export async function getGoogleMailboxAccessToken(mailboxEmail: string): Promise
   const jwtAssertion = `${signatureInput}.${signature}`;
 
   // Exchange JWT for OAuth2 token
-  const res = await fetch('https://oauth2.googleapis.com/token', {
+  const res = await gmailFetch('https://oauth2.googleapis.com/token', {
     method: 'POST',
     headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
     body: new URLSearchParams({
@@ -107,7 +121,7 @@ export async function getGoogleMailboxAccessToken(mailboxEmail: string): Promise
  */
 export function buildMimeMessage(params: SendEmailParams): string {
   const domain = params.fromEmail.split('@')[1] || 'domain.com';
-  const messageId = `<blast-${Date.now()}-${crypto.randomBytes(6).toString('hex')}@${domain}>`;
+  const messageId = params.rfcMessageId || `<blast-${Date.now()}-${crypto.randomBytes(6).toString('hex')}@${domain}>`;
 
   const baseUrl = process.env.NEXT_PUBLIC_APP_URL || 'https://' + domain;
   const unsubEmail = `unsubscribe@${domain}`;
@@ -145,17 +159,18 @@ export function buildMimeMessage(params: SendEmailParams): string {
  * with Nodemailer SMTP fallback if configured.
  */
 export class GmailMailProvider implements MailProvider {
+  constructor(private tokenResolver?: (email: string) => Promise<string>) {}
   async sendEmail(params: SendEmailParams): Promise<{ messageId: string; success: boolean }> {
     // 1. Primary: Google Workspace Gmail API via Domain-Wide Delegation
-    if (hasLiveGoogleCredentials()) {
+    if (this.tokenResolver || hasLiveGoogleCredentials()) {
       let dispatchStarted = false;
       try {
-        const token = await getGoogleMailboxAccessToken(params.fromEmail);
+        const token = await (this.tokenResolver || getGoogleMailboxAccessToken)(params.fromEmail);
         const mime = buildMimeMessage(params);
         const rawBase64Url = Buffer.from(mime).toString('base64url');
 
         dispatchStarted = true;
-        const res = await fetch('https://gmail.googleapis.com/gmail/v1/users/me/messages/send', {
+        const res = await gmailFetch('https://gmail.googleapis.com/gmail/v1/users/me/messages/send', {
           method: 'POST',
           headers: {
             Authorization: `Bearer ${token}`,
@@ -173,7 +188,7 @@ export class GmailMailProvider implements MailProvider {
         return { messageId: data.id, success: true };
       } catch (err) {
         // If SMTP fallback credentials exist, attempt fallback
-        if (!dispatchStarted && hasLiveSmtpCredentials()) {
+        if (!this.tokenResolver && !dispatchStarted && hasLiveSmtpCredentials()) {
           console.warn('[GmailMailProvider] Gmail API failed, falling back to SMTP:', err);
           return this.sendViaSmtp(params);
         }
@@ -229,8 +244,9 @@ export class GmailMailProvider implements MailProvider {
  * and checks for incoming human replies / opt-out keywords.
  */
 export class GmailBounceSource implements BounceSource {
+  constructor(private tokenResolver?: (email: string) => Promise<string>) {}
   async getBounces(mailboxId: string): Promise<BounceEvent[]> {
-    if (!hasLiveGoogleCredentials()) {
+    if (!this.tokenResolver && !hasLiveGoogleCredentials()) {
       throw new Error('Google credentials are required for bounce checks.');
     }
 
@@ -238,24 +254,17 @@ export class GmailBounceSource implements BounceSource {
       const mailboxEmail = mailboxId.includes('@') ? mailboxId : null;
       if (!mailboxEmail) throw new Error('A mailbox email address is required for bounce checks.');
 
-      const token = await getGoogleMailboxAccessToken(mailboxEmail);
+      const token = await (this.tokenResolver || getGoogleMailboxAccessToken)(mailboxEmail);
 
       // Search for Delivery Status Notifications in inbox
       const query = 'in:anywhere from:(mailer-daemon OR postmaster) newer_than:2d';
-      const listUrl = `https://gmail.googleapis.com/gmail/v1/users/me/messages?q=${encodeURIComponent(query)}&maxResults=20`;
-
-      const listRes = await fetch(listUrl, {
-        headers: { Authorization: `Bearer ${token}` },
-      });
-
-      if (!listRes.ok) throw new Error('Bounce lookup failed.');
-      const listData = (await listRes.json()) as { messages?: { id: string }[] };
-      if (!listData.messages || listData.messages.length === 0) return [];
+      const messages = await listSignalMessages(token, query);
+      if (!messages.length) return [];
 
       const events: BounceEvent[] = [];
 
-      for (const msg of listData.messages) {
-        const msgRes = await fetch(
+      for (const msg of messages) {
+        const msgRes = await gmailFetch(
           `https://gmail.googleapis.com/gmail/v1/users/me/messages/${msg.id}?format=full`,
           { headers: { Authorization: `Bearer ${token}` } }
         );
@@ -301,24 +310,17 @@ export class GmailBounceSource implements BounceSource {
    * Auto-replies (Auto-Submitted, Out of Office) are filtered out.
    */
   async checkReplies(mailboxEmail: string): Promise<{ email: string; isOptOut: boolean; body: string }[]> {
-    if (!hasLiveGoogleCredentials()) throw new Error('Google credentials are required for reply checks.');
+    if (!this.tokenResolver && !hasLiveGoogleCredentials()) throw new Error('Google credentials are required for reply checks.');
 
     try {
-      const token = await getGoogleMailboxAccessToken(mailboxEmail);
+      const token = await (this.tokenResolver || getGoogleMailboxAccessToken)(mailboxEmail);
       const query = 'is:inbox -from:(mailer-daemon OR postmaster) newer_than:2d';
-      const listUrl = `https://gmail.googleapis.com/gmail/v1/users/me/messages?q=${encodeURIComponent(query)}&maxResults=20`;
-
-      const listRes = await fetch(listUrl, {
-        headers: { Authorization: `Bearer ${token}` },
-      });
-      if (!listRes.ok) throw new Error('Reply lookup failed.');
-      const listData = (await listRes.json()) as { messages?: { id: string }[] };
-      if (!listData.messages) return [];
+      const messages = await listSignalMessages(token, query);
 
       const replies: { email: string; isOptOut: boolean; body: string }[] = [];
 
-      for (const msg of listData.messages) {
-        const msgRes = await fetch(
+      for (const msg of messages) {
+        const msgRes = await gmailFetch(
           `https://gmail.googleapis.com/gmail/v1/users/me/messages/${msg.id}?format=full`,
           { headers: { Authorization: `Bearer ${token}` } }
         );
@@ -370,20 +372,21 @@ export class GmailBounceSource implements BounceSource {
  * Promotions is NOT spam.
  */
 export class GmailSeedChecker implements SeedChecker {
+  constructor(private tokenResolver?: (email: string) => Promise<string>) {}
   async checkSeedPlacement(
     seedEmail: string,
     campaignId: string,
     mailboxId: string,
     seedToken?: string,
   ): Promise<SeedCheckResult> {
-    if (hasLiveGoogleCredentials()) {
+    if (this.tokenResolver || hasLiveGoogleCredentials()) {
       try {
-        const token = await getGoogleMailboxAccessToken(seedEmail);
+        const token = await (this.tokenResolver || getGoogleMailboxAccessToken)(seedEmail);
 
         // Search for message received by seed inbox
         if (!seedToken) throw new Error('A seed token is required to match this probe.');
         const q = `in:anywhere to:${seedEmail} from:${mailboxId} "${seedToken}" newer_than:2d`;
-        const listRes = await fetch(
+        const listRes = await gmailFetch(
           `https://gmail.googleapis.com/gmail/v1/users/me/messages?q=${encodeURIComponent(q)}&maxResults=5`,
           { headers: { Authorization: `Bearer ${token}` } }
         );
@@ -392,7 +395,7 @@ export class GmailSeedChecker implements SeedChecker {
           const listData = (await listRes.json()) as { messages?: { id: string }[] };
           if (listData.messages && listData.messages.length > 0) {
             const firstMsgId = listData.messages[0].id;
-            const msgRes = await fetch(
+            const msgRes = await gmailFetch(
               `https://gmail.googleapis.com/gmail/v1/users/me/messages/${firstMsgId}?format=minimal`,
               { headers: { Authorization: `Bearer ${token}` } }
             );

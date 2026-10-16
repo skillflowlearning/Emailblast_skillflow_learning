@@ -8,14 +8,16 @@ import { Card, CardContent } from '@/components/ui/card';
 function UnsubscribeContent() {
   const searchParams = useSearchParams();
   const token = searchParams.get('token') || searchParams.get('recipient') || '';
-  const [email, setEmail] = useState(token);
+  const [email, setEmail] = useState('');
   const [loading, setLoading] = useState(false);
   const [unsubscribed, setUnsubscribed] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
   useEffect(() => {
     if (token) {
-      setEmail(token);
+      fetch(`/api/unsubscribe?token=${encodeURIComponent(token)}`).then((response) => response.json()).then((result) => {
+        if (result.email) setEmail(result.email); else setError(result.error || 'Invalid unsubscribe link.');
+      }).catch(() => setError('Unable to verify this unsubscribe link.'));
     }
   }, [token]);
 
@@ -32,7 +34,7 @@ function UnsubscribeContent() {
       const res = await fetch('/api/unsubscribe', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ email }),
+        body: JSON.stringify({ token }),
       });
 
       if (!res.ok) {

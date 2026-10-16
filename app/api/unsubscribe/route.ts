@@ -1,56 +1,26 @@
 import { NextRequest, NextResponse } from 'next/server';
-import { blastStorage } from '@/lib/services/blastStorage';
-
-/**
- * Public Unsubscribe API Route
- * Compliant with RFC 8058 One-Click Unsubscribe (POST) and standard link unsubscribe (GET)
- */
-export async function POST(req: NextRequest) {
-  try {
-    const url = new URL(req.url);
-    const token = url.searchParams.get('token') || url.searchParams.get('recipient') || '';
-    
-    // Also parse body if provided
-    let email = token;
-    try {
-      const body = await req.json();
-      if (body.email) email = body.email;
-    } catch {
-      // Body might be empty or form-encoded
-    }
-
-    if (!email || !email.includes('@')) {
-      return NextResponse.json({ error: 'Valid email address or token required' }, { status: 400 });
-    }
-
-    await blastStorage.addSuppression(email, 'User unsubscribed via One-Click List-Unsubscribe');
-
-    return NextResponse.json({
-      success: true,
-      message: `${email} has been permanently suppressed from future emails.`,
-    });
-  } catch (err: any) {
-    return NextResponse.json({ error: err.message || 'Failed to process unsubscribe' }, { status: 500 });
-  }
+import { unseal } from '@/lib/server/secrets';
+import { workspaceStore } from '@/lib/server/store';
+import { recalculateDue } from '@/lib/server/schedule';
+export const runtime = 'nodejs';
+async function identity(token: string) {
+  const data = await unseal<{ owner: string; email: string; expires: number }>(token);
+  if (!data.owner || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(data.email) || data.expires < Date.now()) throw new Error('Invalid unsubscribe link.');
+  return data;
 }
-
-export async function GET(req: NextRequest) {
+export async function GET(request: NextRequest) {
+  try { const data = await identity(request.nextUrl.searchParams.get('token') || ''); return NextResponse.json({ email: data.email }); }
+  catch { return NextResponse.json({ error: 'This unsubscribe link is invalid or expired.' }, { status: 400 }); }
+}
+export async function POST(request: NextRequest) {
   try {
-    const url = new URL(req.url);
-    const token = url.searchParams.get('token') || url.searchParams.get('recipient') || '';
-
-    if (!token || !token.includes('@')) {
-      return NextResponse.json({ error: 'Invalid token' }, { status: 400 });
-    }
-
-    await blastStorage.addSuppression(token, 'User unsubscribed via link');
-
-    return NextResponse.json({
-      success: true,
-      unsubscribed: token,
-      message: 'Successfully unsubscribed from future communications.',
+    const body = await request.json().catch(() => ({}));
+    const data = await identity(request.nextUrl.searchParams.get('token') || body.token || '');
+    await workspaceStore().transact(data.owner, (workspace) => {
+      workspace.suppression[data.email] = { reason: 'Recipient unsubscribed', at: Date.now() };
+      for (const saved of Object.values(workspace.campaigns)) for (const recipient of saved.state.recipients) if (recipient.email.toLowerCase() === data.email && recipient.status === 'pending') { recipient.status = 'skipped'; recipient.skipReason = 'Recipient unsubscribed'; }
+      recalculateDue(workspace);
     });
-  } catch (err: any) {
-    return NextResponse.json({ error: err.message }, { status: 500 });
-  }
+    return NextResponse.json({ success: true, message: 'Unsubscribed successfully.' });
+  } catch { return NextResponse.json({ error: 'This unsubscribe link is invalid or expired.' }, { status: 400 }); }
 }

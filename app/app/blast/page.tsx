@@ -1,5 +1,5 @@
 'use client';
-import { useState, useRef, useMemo } from 'react';
+import { useState, useRef, useMemo, useEffect } from 'react';
 import Link from 'next/link';
 import Papa from 'papaparse';
 import {
@@ -41,6 +41,8 @@ import {
   BlastMailbox,
 } from '@/lib/types/blast';
 import { blastEngine } from '@/lib/services/blastEngine';
+import type { EngineState } from '@/lib/services/blastEngine';
+import { api } from '@/lib/client/api';
 import { isSuppressed } from '@/lib/services/suppression';
 import LiveCampaignView from '@/components/blast/LiveCampaignView';
 
@@ -74,7 +76,7 @@ export default function BlastPage() {
   const [campaignName, setCampaignName] = useState('Product Launch Outreach');
   const [subject, setSubject] = useState('Quick question regarding your email infrastructure, {{name}}');
   const [body, setBody] = useState(
-    `Hi {{name}},\n\nI noticed your recent work in email infrastructure and wanted to connect.\n\nWe help companies keep deliverability above 99% using automated mailbox warming, rate-limiting, and seed placement checks.\n\nWould you have 10 minutes for a brief chat this week?\n\nBest regards,`
+    `Hi {{name}},\n\nI noticed your recent work in email infrastructure and wanted to connect.\n\nWe help teams manage paced sending and monitor mailbox health using seed placement checks.\n\nWould you have 10 minutes for a brief chat this week?\n\nBest regards,`
   );
   const [senderName, setSenderName] = useState('Alex Rivera');
   const [businessAddress, setBusinessAddress] = useState('100 Innovation Way, Suite 400, San Francisco, CA 94105');
@@ -120,13 +122,30 @@ export default function BlastPage() {
     error?: string;
   } | null>(null);
   const [startError, setStartError] = useState<string | null>(null);
+  const [isStarting, setIsStarting] = useState(false);
   const [consent, setConsent] = useState(false);
   const [activeCampaignData, setActiveCampaignData] = useState<{
+    savedCampaignId?: string;
+    initialEngineState?: EngineState;
     campaign: Campaign;
     recipients: Recipient[];
     domains: BlastDomain[];
     mailboxes: BlastMailbox[];
   } | null>(null);
+  const [loadingSaved, setLoadingSaved] = useState(false);
+  useEffect(() => {
+    const id = new URLSearchParams(window.location.search).get('campaign');
+    if (!id) return;
+    setLoadingSaved(true);
+    api<{ state: EngineState }>(`/api/campaigns/${encodeURIComponent(id)}`).then(({ state }) => setActiveCampaignData({
+      campaign: state.campaign, recipients: state.recipients, mailboxes: state.mailboxes, domains: state.domains,
+      savedCampaignId: id, initialEngineState: state,
+    })).catch((error) => setStartError(error.message)).finally(() => setLoadingSaved(false));
+  }, []);
+  useEffect(() => {
+    if (providerMode !== 'live') return;
+    api<{ domains: BlastDomain[]; mailboxes: BlastMailbox[] }>('/api/workspace').then((result) => { setDomains(result.domains); setMailboxes(result.mailboxes); }).catch((error) => setStartError(error.message));
+  }, [providerMode]);
 
   // ── Helper: Download Sample CSV ───────────────────────────────────────
   const handleDownloadSampleCSV = () => {
@@ -445,6 +464,7 @@ export default function BlastPage() {
 
   // ── Step 5: Start Campaign Execution ──────────────────────────────────
   const handleStartCampaign = async () => {
+    if (isStarting) return;
     setStartError(null);
 
     if (!consent) {
@@ -471,25 +491,20 @@ export default function BlastPage() {
 
       // Check server-side credentials
       try {
-        const statusRes = await fetch('/api/blast/worker', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ action: 'status' }),
-        });
-        const statusData = await statusRes.json();
+        const statusData = await api<{ canRunLive: boolean; providerMode: string; seedEmails: string[] }>('/api/blast/worker', { action: 'status' });
         if (!statusData.canRunLive) {
           setStartError(
-            'Live Mode Requires Credentials: Missing Google Workspace Service Account credentials (GOOGLE_SERVICE_ACCOUNT_EMAIL and GOOGLE_SERVICE_ACCOUNT_PRIVATE_KEY) with domain-wide delegation or SMTP fallback credentials in .env.local. Refusing to start live campaign.'
+            'Configure Google OAuth on the server, then connect your sending accounts on the Domains page.'
           );
           return;
         }
         if (statusData.providerMode !== 'live' || !statusData.seedEmails?.length) {
-          setStartError('Live campaigns require BLAST_PROVIDER_MODE=live and BLAST_SEED_EMAILS configured on the server.');
+          setStartError('Enable live mode on the server and connect an owned seed inbox on the Domains page.');
           return;
         }
       } catch {
         // Fallback safety refusal if server cannot confirm credentials
-        setStartError('Could not verify server credentials for Live Mode. Please check .env.local.');
+        setStartError('Could not verify live setup. Open the Domains page and check your connections.');
         return;
       }
     }
@@ -534,23 +549,31 @@ export default function BlastPage() {
       providerMode,
     };
 
-    setActiveCampaignData({
-      campaign: fullCampaign,
-      recipients: updatedRecipients,
-      domains,
-      mailboxes: updatedMailboxes,
-    });
+    setIsStarting(true);
+    try {
+      const { id } = await api<{ id: string }>('/api/campaigns', { ...fullCampaign,
+        recipients: validRecipients, mailboxIds: mailboxes.filter((m) => m.status === 'active').map((m) => m.id) });
+      const { state } = await api<{ state: EngineState }>(`/api/campaigns/${id}`);
+      window.history.replaceState(null, '', `/app/blast?campaign=${encodeURIComponent(id)}`);
+      setActiveCampaignData({ campaign: state.campaign, recipients: state.recipients, domains: state.domains,
+        mailboxes: state.mailboxes, savedCampaignId: id, initialEngineState: state });
+    } catch (error) { setStartError((error as Error).message); }
+    finally { setIsStarting(false); }
   };
 
   // ── If Live Campaign is running, show LiveCampaignView ────────────────
+  if (loadingSaved) return <p className="p-8">Loading your saved campaign…</p>;
   if (activeCampaignData) {
     return (
       <LiveCampaignView
+        savedCampaignId={activeCampaignData.savedCampaignId}
+        initialEngineState={activeCampaignData.initialEngineState}
         initialCampaign={activeCampaignData.campaign}
         initialRecipients={activeCampaignData.recipients}
         initialDomains={activeCampaignData.domains}
         initialMailboxes={activeCampaignData.mailboxes}
         onReset={() => {
+          window.history.replaceState(null, '', '/app/blast');
           setActiveCampaignData(null);
           setStep(0);
           setConsent(false);
@@ -1193,7 +1216,7 @@ export default function BlastPage() {
                     Sending Engine Mode
                   </p>
                   <p className="text-sm font-medium text-gray-900 dark:text-white mt-0.5">
-                    {providerMode === 'simulation' ? 'Simulation Sandbox (No Real Emails Sent)' : 'Live Google Workspace (Gmail API & SMTP Fallback)'}
+                    {providerMode === 'simulation' ? 'Simulation Sandbox (No Real Emails Sent)' : 'Connected Google Workspace (Gmail API)'}
                   </p>
                 </div>
                 <Badge variant={providerMode === 'live' ? 'destructive' : 'secondary'} className="capitalize">
@@ -1240,7 +1263,7 @@ export default function BlastPage() {
                     Live Google Workspace Mode
                   </p>
                   <p className="text-[11px] text-gray-500 mt-1 leading-relaxed">
-                    Sends real cold outreach via Google Workspace service account (domain-wide delegation) or Nodemailer SMTP fallback. Requires credentials.
+                    Uses the Workspace accounts connected on the Domains page. Requires verified domains, a seed inbox, healthy senders and a spare.
                   </p>
                 </button>
               </div>
@@ -1397,10 +1420,10 @@ export default function BlastPage() {
               </Button>
               <Button
                 onClick={handleStartCampaign}
-                disabled={!consent}
+                disabled={!consent || isStarting}
                 className="min-w-[160px]"
               >
-                <Send className="w-4 h-4 mr-2" /> Start Campaign
+                <Send className="w-4 h-4 mr-2" /> {isStarting ? 'Saving Campaign…' : 'Start Campaign'}
               </Button>
             </div>
           </CardContent>

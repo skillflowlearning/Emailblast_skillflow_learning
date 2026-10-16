@@ -81,3 +81,30 @@ test('SMTP is not retried after Gmail dispatch starts and its response is lost',
     assert.equal(smtpCalls, 0);
   });
 });
+
+test('bounce scan reads later pages rather than missing their notifications', async () => {
+  await withGoogle(async () => {
+    let pages = 0;
+    globalThis.fetch = async (input) => {
+      const url = new URL(String(input));
+      if (url.pathname.endsWith('/messages')) {
+        pages++;
+        if (!url.searchParams.has('pageToken')) return json({ messages: [], nextPageToken: 'next-page' });
+        assert.equal(url.searchParams.get('pageToken'), 'next-page');
+        return json({ messages: [{ id: 'later-dsn' }] });
+      }
+      return json({ internalDate: '2000', payload: { body: { data: Buffer.from('Final-Recipient: rfc822; later@example.com\r\nStatus: 5.1.1').toString('base64url') } } });
+    };
+    const events = await new GmailBounceSource(async () => 'test-token').getBounces('sender@test.invalid');
+    assert.equal(pages, 2); assert.equal(events[0].email, 'later@example.com');
+  });
+});
+
+test('a signal backlog beyond the bounded scan cannot be reported as healthy', async () => {
+  await withGoogle(async () => {
+    let pages = 0;
+    globalThis.fetch = async () => { pages++; return json({ messages: [], nextPageToken: 'more' }); };
+    await assert.rejects(new GmailBounceSource(async () => 'test-token').getBounces('sender@test.invalid'));
+    assert.equal(pages, 5);
+  });
+});

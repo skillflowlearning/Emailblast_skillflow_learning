@@ -15,3 +15,11 @@ const app = getApps().length === 0 ? initializeApp(firebaseConfig) : getApps()[0
 export const auth = getAuth(app);
 export const db = getFirestore(app);
 export default app;
+
+/** Runtime config lets a deployed container receive Firebase settings securely at startup. */
+export async function browserAuth() {
+  const config = await fetch('/api/public-config', { cache: 'no-store' }).then((response) => response.json());
+  if (!config.firebase) throw new Error('Configure your Firebase web app and enable Google sign-in first.');
+  const browserApp = getApps().find((item) => item.name === 'mailflow-browser') || initializeApp(config.firebase, 'mailflow-browser');
+  return getAuth(browserApp);
+}

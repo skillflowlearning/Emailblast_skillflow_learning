@@ -21,6 +21,7 @@ export interface EngineState {
 }
 
 interface EngineOptions {
+  seedEmails?: string[];
   now?: () => number;
   random?: () => number;
   storage?: Pick<typeof blastStorage, 'isEmailSuppressed' | 'addSuppression' | 'recordSeedResult'>;
@@ -55,6 +56,7 @@ export class BlastEngine {
   private now: () => number;
   private random: () => number;
   private storage: NonNullable<EngineOptions['storage']>;
+  private seedEmails?: string[];
 
   constructor(
     private mailProvider: MailProvider = getActiveMailProvider(),
@@ -65,6 +67,7 @@ export class BlastEngine {
     this.now = options.now || Date.now;
     this.random = options.random || Math.random;
     this.storage = options.storage || blastStorage;
+    this.seedEmails = options.seedEmails;
   }
 
   private event(state: EngineState, title: string, description: string, level: BlastEvent['level'] = 'info', mailbox?: BlastMailbox) {
@@ -204,6 +207,8 @@ export class BlastEngine {
       domain.flaggedMailboxCount = members.filter((m) => m.healthFlaggedAt !== undefined).length;
       if (domain.flaggedMailboxCount >= 2 && domain.status !== 'paused') {
         domain.status = 'paused';
+        domain.pausedAt = this.now();
+        domain.cooldownUntil = this.now() + 72 * 3600000;
         this.event(state, 'Domain Paused', `${domain.name}: two mailboxes flagged. All mailboxes on this domain are blocked.`, 'error');
       } else if (domain.flaggedMailboxCount && domain.status === 'active') domain.status = 'watch';
       if (domain.status === 'paused') {
@@ -237,6 +242,7 @@ export class BlastEngine {
     const m = state.mailboxes.find((mailbox) => mailbox.id === mailboxId);
     if (!m || state.domains.find((d) => d.id === m.domainId)?.status === 'paused') return original;
     if (m.cooldownUntil && m.cooldownUntil > this.now()) return original;
+    if (!state.simulationMode && m.healthFlaggedAt !== undefined && ((m.healthPassedAt || 0) <= (m.cooldownUntil || m.healthFlaggedAt) || this.now() - (m.healthPassedAt || 0) > 3600000)) return original;
     m.status = 'active';
     if (m.healthFlaggedAt !== undefined) {
       m.dailyCap = BLAST_CONFIG.RESUME_DAILY_CAP_INITIAL;
@@ -253,6 +259,10 @@ export class BlastEngine {
 
   private delay(seconds: number, state: EngineState) {
     return seconds * 1000 / (state.simulationMode ? Math.max(1, Math.min(120, state.simulationSpeedMultiplier || 1)) : 1);
+  }
+
+  reconcileState(original: EngineState): EngineState {
+    const state = this.clone(original); this.resetDay(state); return this.enforceRules(state);
   }
 
   /** One due operation per tick. Deadlines avoid multi-minute requests and sleeps. */
@@ -274,7 +284,7 @@ export class BlastEngine {
         const bounces = await this.bounceSource.getBounces(sourceId);
         for (const bounce of bounces) {
           const recipient = state.recipients.find((r) => r.mailboxId === mailboxId && r.email.toLowerCase() === bounce.email.toLowerCase() && r.status === 'sent');
-          if (!recipient) continue; // Ignore unrelated and already-processed notifications.
+          if (!recipient || (recipient.sentAt && bounce.timestamp < recipient.sentAt)) continue;
           mailbox.bouncesCount++;
           bouncedThisBatch++;
           recipient.status = 'bounced';
@@ -316,7 +326,7 @@ export class BlastEngine {
     if (!state.simulationMode && !inSendingWindow(state.campaign, now)) return result();
     const pending = state.recipients.find((r) => r.mailboxId === mailboxId && r.status === 'pending' && !r.sentAt);
     if (!pending) return result();
-    const seeds = state.simulationMode ? BLAST_CONFIG.DEFAULT_SEEDS : BLAST_CONFIG.LIVE_SEEDS;
+    const seeds = state.simulationMode ? BLAST_CONFIG.DEFAULT_SEEDS : this.seedEmails || BLAST_CONFIG.LIVE_SEEDS;
     const isSeed = (mailbox.recipientSendsSinceSeed || 0) >= BLAST_CONFIG.SEED_INTERVAL - 1;
     if (!state.simulationMode && (!seeds.length || !state.campaign.senderName.trim() || !state.campaign.businessAddress.trim() || !state.campaign.optOutText.trim())) {
       state.campaign.status = 'alert_paused';
@@ -364,9 +374,10 @@ export class BlastEngine {
         mailbox.signalCheckAt = now + this.delay(120, state);
         this.event(state, 'Batch Waiting for Signals', `${mailbox.email}: ${mailbox.batchSentCount} messages sent; waiting 2 minutes before signal evaluation${state.simulationMode ? ' (accelerated simulation)' : ''}.`, 'info', mailbox);
       }
-    } catch {
+    } catch (error) {
       // Do not automatically resend after an ambiguous transport failure.
-      if (!isSeed) { pending.status = 'sending'; pending.skipReason = 'Delivery outcome unknown; review before retrying'; }
+      const blocked = error instanceof Error && 'deliveryNotStarted' in error;
+      if (!isSeed && !blocked) { pending.status = 'sending'; pending.skipReason = 'Delivery outcome unknown; review before retrying'; }
       state.campaign.status = 'alert_paused';
       state.campaign.rootCauseHint = 'Mail transport failed. Campaign paused for delivery review to avoid duplicate sends.';
       this.event(state, 'Sending Failed', state.campaign.rootCauseHint, 'error', mailbox);

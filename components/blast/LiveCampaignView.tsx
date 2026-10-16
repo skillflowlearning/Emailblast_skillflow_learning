@@ -35,8 +35,11 @@ import {
 } from '@/lib/types/blast';
 import { BLAST_CONFIG } from '@/lib/config/blastConfig';
 import { blastEngine, EngineState, sendingDate } from '@/lib/services/blastEngine';
+import { api } from '@/lib/client/api';
 
 interface LiveCampaignViewProps {
+  savedCampaignId?: string;
+  initialEngineState?: EngineState;
   initialCampaign: Campaign;
   initialRecipients: Recipient[];
   initialDomains: BlastDomain[];
@@ -50,9 +53,11 @@ export default function LiveCampaignView({
   initialDomains,
   initialMailboxes,
   onReset,
+  savedCampaignId,
+  initialEngineState,
 }: LiveCampaignViewProps) {
   // Engine State
-  const [engineState, setEngineState] = useState<EngineState>(() => ({
+  const [engineState, setEngineState] = useState<EngineState>(() => initialEngineState || ({
     campaign: initialCampaign,
     recipients: initialRecipients,
     domains: initialDomains,
@@ -81,17 +86,29 @@ export default function LiveCampaignView({
   const isTickingRef = useRef(false);
   const [isTicking, setIsTicking] = useState(false);
   const [liveSeeds, setLiveSeeds] = useState<string[]>([]);
+  const [requestError, setRequestError] = useState('');
+  const [workerHeartbeat, setWorkerHeartbeat] = useState<number>();
 
   const { campaign, recipients, domains, mailboxes, events } = engineState;
+  const serverAction = async (action: string, target?: string) => {
+    if (!savedCampaignId) return;
+    setRequestError('');
+    try { const result = await api<{ state: EngineState }>(`/api/campaigns/${savedCampaignId}`, { action, target }); setEngineState(result.state); }
+    catch (error) { setRequestError((error as Error).message); }
+  };
+  useEffect(() => {
+    if (!savedCampaignId) return;
+    let cancelled = false;
+    const refresh = () => api<{ state: EngineState; killSwitch: boolean; workerHeartbeat?: number }>(`/api/campaigns/${savedCampaignId}`)
+      .then((result) => { if (!cancelled) { setEngineState(result.state); setKillSwitchActive(result.killSwitch); setWorkerHeartbeat(result.workerHeartbeat); } })
+      .catch((error) => { if (!cancelled) setRequestError(error.message); });
+    refresh(); const timer = setInterval(refresh, 2000);
+    return () => { cancelled = true; clearInterval(timer); };
+  }, [savedCampaignId]);
 
   // Sync initial kill switch status from server
   useEffect(() => {
-    fetch('/api/blast/worker', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ action: 'status' }),
-    })
-      .then((r) => r.json())
+    api<{ killSwitchActive: boolean; seedEmails: string[] }>('/api/blast/worker', { action: 'status' })
       .then((d) => {
         if (d.killSwitchActive) setKillSwitchActive(true);
         if (Array.isArray(d.seedEmails)) setLiveSeeds(d.seedEmails);
@@ -102,16 +119,13 @@ export default function LiveCampaignView({
   // ── Global Emergency Kill Switch Handler ──────────────────────────────────
   const handleToggleKillSwitch = async () => {
     const next = !killSwitchActive;
-    setKillSwitchActive(next);
 
     try {
-      await fetch('/api/blast/worker', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ action: next ? 'kill' : 'unkill' }),
-      });
+      await api('/api/blast/worker', { action: next ? 'kill' : 'unkill' });
+      setKillSwitchActive(next); setRequestError('');
     } catch (err) {
-      console.error('Failed to update kill switch state on server worker:', err);
+      setRequestError((err as Error).message || 'Emergency stop could not be saved.');
+      return;
     }
 
     if (next) {
@@ -152,6 +166,7 @@ export default function LiveCampaignView({
 
   // ── Auto-Tick Loop (Simulates parallel batches via server worker) ──────────
   useEffect(() => {
+    if (savedCampaignId) return;
     if (!isSimulating || !['running', 'alert_paused'].includes(campaign.status) || killSwitchActive) return;
 
     const interval = setInterval(async () => {
@@ -239,10 +254,11 @@ export default function LiveCampaignView({
     }, 2000); // 2-second simulation tick interval
 
     return () => clearInterval(interval);
-  }, [isSimulating, campaign.status, killSwitchActive, engineState]);
+  }, [isSimulating, campaign.status, killSwitchActive, engineState, savedCampaignId]);
 
   // ── Manual Step Batch (Run 1 Batch on all active mailboxes) ─────────────
   const handleStepBatch = async () => {
+    if (savedCampaignId) return;
     if (!engineState.simulationMode || campaign.status !== 'running' || killSwitchActive || isTickingRef.current) return;
     isTickingRef.current = true;
     setIsTicking(true);
@@ -264,6 +280,7 @@ export default function LiveCampaignView({
 
   // ── Manual Campaign Pause / Resume ───────────────────────────────────────
   const toggleCampaignStatus = () => {
+    if (savedCampaignId) { void serverAction(campaign.status === 'running' ? 'pause' : 'resume'); return; }
     setEngineState((prev) => {
       const nextStatus = prev.campaign.status === 'running' ? 'paused' : 'running';
       const event: BlastEvent = {
@@ -284,6 +301,7 @@ export default function LiveCampaignView({
 
   // ── Manual Mailbox Pause / Resume ────────────────────────────────────────
   const toggleMailboxStatus = (mailboxId: string) => {
+    if (savedCampaignId) { void serverAction('mailbox', mailboxId); return; }
     setEngineState((prev) => {
       const target = prev.mailboxes.find((m) => m.id === mailboxId);
       if (!target) return prev;
@@ -334,6 +352,7 @@ export default function LiveCampaignView({
 
   // ── Manual Domain Pause / Resume ─────────────────────────────────────────
   const toggleDomainStatus = (domainId: string) => {
+    if (savedCampaignId) { void serverAction('domain', domainId); return; }
     setEngineState((prev) => {
       const target = prev.domains.find((d) => d.id === domainId);
       if (!target) return prev;
@@ -399,18 +418,21 @@ export default function LiveCampaignView({
   const handleInjectBounce = () => {
     const id = getSelectedMailboxId();
     if (!id) return;
+    if (savedCampaignId) { void serverAction('inject-bounce', id); return; }
     setEngineState((prev) => blastEngine.injectSimulatedBounce(id, prev));
   };
 
   const handleInjectSpam = () => {
     const id = getSelectedMailboxId();
     if (!id) return;
+    if (savedCampaignId) { void serverAction('inject-spam', id); return; }
     setEngineState((prev) => blastEngine.injectSimulatedSpamPlacement(id, prev));
   };
 
   const handleInjectDelay = () => {
     const id = getSelectedMailboxId();
     if (!id) return;
+    if (savedCampaignId) { void serverAction('inject-delay', id); return; }
     setEngineState((prev) => blastEngine.injectDelayedSignalEvent(id, prev));
   };
 
@@ -441,6 +463,11 @@ export default function LiveCampaignView({
 
   return (
     <div className="max-w-5xl mx-auto space-y-8 pb-12">
+      {requestError && <p role="alert" className="p-4 bg-red-50 text-red-700 rounded-xl">{requestError}</p>}
+      {savedCampaignId && <div className="p-4 bg-blue-50 text-blue-900 rounded-xl text-sm">
+        <strong>Campaign saved.</strong> You can close this tab and reopen it from Campaigns.
+        <p>{workerHeartbeat ? `Last worker activity: ${new Date(workerHeartbeat).toLocaleString()}.` : 'Start/configure the background worker to continue sending. See the setup guide.'}</p>
+      </div>}
       {/* ── Top Header & Campaign Status ──────────────────────────────────── */}
       <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4">
         <div>
@@ -569,9 +596,10 @@ export default function LiveCampaignView({
                 size="sm"
                 variant={isSimulating ? 'outline' : 'secondary'}
                 onClick={() => setIsSimulating(!isSimulating)}
+                disabled={Boolean(savedCampaignId)}
                 className="h-8 text-xs rounded-xl"
               >
-                {isSimulating ? (
+                {savedCampaignId ? 'Background worker' : isSimulating ? (
                   <>
                     <Pause className="w-3 h-3 mr-1" /> Pause Auto-Ticker
                   </>
@@ -585,7 +613,7 @@ export default function LiveCampaignView({
                 size="sm"
                 variant="outline"
                 onClick={handleStepBatch}
-                disabled={isTicking || killSwitchActive || campaign.status !== 'running'}
+                disabled={Boolean(savedCampaignId) || isTicking || killSwitchActive || campaign.status !== 'running'}
                 className="h-8 text-xs rounded-xl font-medium"
                 title="Send one batch tick immediately"
               >
@@ -681,7 +709,7 @@ export default function LiveCampaignView({
               </span>
             </div>
             <p className="text-xs text-gray-600 dark:text-gray-300 line-clamp-2 leading-relaxed">
-              {pendingCount === 0 ? 'All messages delivered.' : etaDescription}
+              {pendingCount === 0 ? 'All recipients processed.' : etaDescription}
             </p>
           </CardContent>
         </Card>
@@ -740,7 +768,7 @@ export default function LiveCampaignView({
             Sending Domains &amp; Mailboxes
           </h2>
           <span className="text-xs text-gray-500">
-            Auto-cooldown: 48h upon threshold violation &bull; Reallocates unsent
+            Cooldown: mailbox 48h · domain 72h &bull; Transfers unsent recipients
           </span>
         </div>
 

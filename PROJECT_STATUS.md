@@ -1,44 +1,42 @@
-# Email Blast progress — SkillFlow Learning
+# Email Blast status — 16 October 2026
 
-## Scope
+## Implemented
 
-Email Blast is the current priority. List cleaning, standalone spam scoring, and AI template integrations are deferred.
+- Saved campaigns and all recipients (maximum 10,000 per import), reloadable from Campaigns.
+- Separate local worker; browser closure does not drive or stop sending.
+- Production Firestore transaction adapter, shared leases, delivery-attempt ledger and durable kill/suppression state.
+- Cloud Tasks next-operation scheduling and authenticated Scheduler recovery endpoint.
+- Firebase owner sessions; localhost-only local sessions; workspace isolation.
+- Google OAuth sender/seed connections with PKCE/state validation and encrypted refresh tokens. Personal Gmail seeds supported through OAuth.
+- Domain ownership TXT and MX/SPF/DKIM/DMARC checks, independent registered-domain launch requirement, shared domain budget and mandatory spare/seed checks.
+- Real owned-seed health jobs, two-minute wait, exact matching probe/folder check and explicit activation.
+- Mailbox 48h / domain 72h cooldown, fresh post-cooldown test, recovery at 8/day. Pending-only failover.
+- Signed owner-scoped unsubscribe tokens and persistent reply/unsubscribe suppression.
+- Crash/network uncertainty holds; positive Gmail Sent reconciliation without automatic resend.
+- Next.js updated to 15.5.28; separate dev/build output directories retained.
 
-## Available in local simulation
+## Verified locally
 
-- Five-step wizard, CSV/text recipients, demo fleet of 9 active mailboxes and 1 spare, campaign dashboard, and event log.
-- A second spam placement within the last three seed results pauses a mailbox for 48 hours and puts its domain on watch. Promotions is not spam.
-- Two health-flagged mailboxes pause the domain and block every mailbox on it.
-- Bounce rate strictly over 3% after at least 50 sends pauses the mailbox.
-- Eligible spares activate automatically. Only pending, never-sent recipients move; sent and in-flight records are preserved. Transfers reserve available capacity and overflow stays queued.
-- No healthy capacity produces an alert and stops the campaign.
-- Sending deadlines enforce random 30–120 second gaps, 10–15 messages per batch, and a two-minute wait before signal evaluation. Simulation accelerates these delays 60×. Live sends use the configured timezone (default Asia/Kolkata) and 10am–6pm window.
-- Daily rollover resets usage, applies a healthy-day ramp, and enforces the 50/day hard cap. Cooldown recovery requires explicit action and starts at 8/day.
-- Every 11th outgoing message is a seed probe and uses mailbox capacity. Probes have unique tokens; Gmail checks include spam folders and match the sender and token.
-- Failed seed/bounce/reply/suppression checks stop or defer sending rather than pretending the mailbox is healthy.
-- Footer, reply address, and provider message IDs are passed through the engine. Replies opt recipients out of future pending sends.
-- Browser/worker state is JSON-safe. The worker rejects overlapping or stale requests within its process. Ambiguous dispatch failures are held for review instead of retried through SMTP.
+- 52 automated tests: engine timing/rules, mocked Gmail/pagination, persistence of 10,000 records and Unicode chunks, cross-worker exclusion, pause during dispatch, uncertainty holds/recovery, health wait, shared registered-domain quota, account isolation, OAuth state/PKCE and unauthorized endpoint rejection.
+- Browser simulation closed at 37/90; worker advanced independently, resumed after a worker restart, and reopening showed completed 90/90.
+- No real mail sent by the simulation or automated tests.
 
-## Verification
+## Required before real launch
 
-- `npm test`: 28 engine/provider checks, with a fake clock and mocked mail/network providers. No real email is sent by these tests.
-- Browser simulation: first spam result left the sender active; second paused it, marked the domain watch, activated the spare, and transferred 9 pending recipients while preserving the already-sent recipient.
-- These checks do not prove real Gmail delivery or production reliability.
+1. Purchase domains, create/licence Workspace users and owned seed accounts, configure DNS/signing.
+2. Create Firebase/Google project, web OAuth client and hosting secrets.
+3. Deploy Firestore rules, Cloud Run, Tasks queue/IAM and Scheduler; test concurrent cloud transactions and recovery in that real project.
+4. Complete real OAuth/refresh/revoke, inbox/spam/bounce/reply and public unsubscribe integration checks with owned test accounts.
+5. Prepare public-app privacy/consent disclosures and applicable Google verification/security assessment.
+6. Review remaining dependency audit findings before public launch. Compatible fixes were applied, but the current audit still reports transitive PostCSS, Firebase gRPC and build-tool dependency advisories; a clean audit is not claimed. Do not blindly run the breaking `npm audit fix --force` downgrade/migration recommendations.
 
-## Remaining before a live launch
+## Current limits / deferred
 
-1. Move campaigns, all recipients, mailbox quotas, suppression, kill switch, and worker ownership to authenticated server storage. Remove the 100-recipient persistence limit.
-2. Implement shared transactional leases, a durable queue, reconciliation for uncertain sends, and recovery after process restarts. Current locks/revisions and local fallback storage are in memory only.
-3. Add a scheduler/worker service that continues without a browser tab, plus campaign reload/resume from saved state.
-4. Connect the actual Workspace sending and seed accounts. Exercise real bounce/reply fixtures, pagination, notification deduplication, and message correlation end to end.
-5. Finish unsubscribe persistence/token verification and test it against the deployed public URL.
-6. Set up domains, DNS authentication, redirection, warm-up, hosting, and monitoring; verify live behavior using only the owner's test address before any recipient campaign.
-7. Add personal Gmail OAuth and Outlook/Yahoo seeds later. Verification and AI templates remain deferred.
+- One unfinished live campaign per workspace; 8 MiB serialized workspace limit. No archive/export or automatic local-to-cloud migration UI.
+- Sent-folder search cannot prove a missing message was never sent. Unresolved holds require operator investigation.
+- Firestore currently stores chunked workspace snapshots; cost/performance at scale needs measurement.
+- Outlook/Yahoo seed providers, paid verification and AI integrations remain pending.
+- Legacy reports/admin/cleaning screens are prototypes; campaign counters come from the saved campaign.
+- No domains, Google credentials, Firebase project, scheduler or production deployment were configured during this implementation.
 
-## Decisions still needed
-
-- Third sending domain and the spare's healthy-domain placement.
-- Actual team mailbox names and owned seed inboxes.
-- Business address, list source, and final hosting/scheduler environment.
-
-Credentials belong in `.env.local` or the deployment secret store, never in this document or GitHub.
+See [GOOGLE_SETUP.md](GOOGLE_SETUP.md) and [DEPLOYMENT.md](DEPLOYMENT.md). Private credentials never belong in GitHub or chat.
