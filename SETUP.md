@@ -9,7 +9,7 @@ This guide explains how to configure Google Workspace for the **Email Blast** sy
 - **Cold Email Provider:** Google Workspace mailboxes only via the **Gmail API** (with SMTP via **Nodemailer** as fallback).
 - **Bounce Handling:** Bounces are **not** received via webhooks; the system directly inspects each sending mailbox's own inbox for Delivery Status Notifications (DSNs from `mailer-daemon` or `postmaster`).
 - **Seed Checker:** Probes seed inboxes via the Gmail API to classify messages into `INBOX`, `CATEGORY_PROMOTIONS`, or `SPAM`. *(Note: Placement in Google Workspace Promotions tab is normal commercial deliverability and is **not** spam).*
-- **Server Worker:** The sending loop runs on the server (`/api/blast/worker`) with lease locks (`leaseExpiresAt`) and idempotency to prevent double-sends even when browser tabs close.
+- **Server Worker:** `/api/blast/worker` executes one due send or signal check per request. The browser currently drives these requests, so closing it stops execution. Locks and request revisions are process-local. A scheduler, authoritative server storage, authentication, and transactional leases are required before live deployment.
 - **Provider Modes:**
   - `simulation` (Default): Fully simulated sandbox with test buttons to inject bounces, spam placements, and delayed signals. No credentials required, zero real emails sent.
   - `live`: Real sending from authorized Google Workspace mailboxes. Refuses to start if credentials or mandatory CAN-SPAM footers are missing.
@@ -67,6 +67,7 @@ Create or update your `.env.local` file:
 ```env
 # Mode: 'simulation' (default) or 'live'
 BLAST_PROVIDER_MODE=simulation
+BLAST_SEED_EMAILS=
 
 # Google Cloud Service Account Credentials
 GOOGLE_SERVICE_ACCOUNT_EMAIL=blast-mailer@your-gcp-project.iam.gserviceaccount.com
@@ -80,6 +81,8 @@ SMTP_PASS=
 ```
 
 > **Security Note:** Never commit `.env.local` or service account private keys to source control. In production environments (e.g. Google Cloud Run, Vercel), store these variables in Google Secret Manager or your hosting provider's secure secret store.
+
+For live seed monitoring, set `BLAST_SEED_EMAILS` to a comma-separated list of real inboxes you own and can access using domain-wide delegation. The demo seed addresses are never used by the live engine. Personal `@gmail.com` inboxes cannot be impersonated through Workspace domain-wide delegation; they require a separate OAuth connection. Outlook/Yahoo integrations remain pending.
 
 ---
 
@@ -106,6 +109,7 @@ SMTP_PASS=
 1. Change `BLAST_PROVIDER_MODE=live` in `.env.local` and restart your server.
 2. In Step 5, the engine verifies that:
    - `GOOGLE_SERVICE_ACCOUNT_EMAIL` and `GOOGLE_SERVICE_ACCOUNT_PRIVATE_KEY` are present.
+   - `BLAST_SEED_EMAILS` contains configured seed inboxes.
    - Mandatory CAN-SPAM details (sender name, postal address, opt-out line) are provided.
    - If credentials are missing, the system refuses to start and displays an actionable error banner.
 

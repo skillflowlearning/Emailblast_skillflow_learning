@@ -54,6 +54,16 @@ export interface BlastMailbox {
   backoffActive?: boolean;
   lastSignalReceivedAt?: number;
   assignedRecipientCount: number;
+  healthFlaggedAt?: number;
+  healthSentBaseline?: number;
+  healthBounceBaseline?: number;
+  dailyResetDate?: string;
+  nextSendAt?: number;
+  batchSentCount?: number;
+  batchTarget?: number;
+  signalCheckAt?: number;
+  recipientSendsSinceSeed?: number;
+  pendingSeedProbes?: { email: string; token: string }[];
 }
 
 export type CampaignStatus =
@@ -76,6 +86,7 @@ export interface Campaign {
   sendingWindow: {
     start: string;
     end: string;
+    timeZone?: string;
   };
   enableRamp: boolean;
   rampPercent: number;
@@ -174,6 +185,7 @@ export interface BounceSource {
    * and human/auto-replies.
    */
   getBounces(mailboxId: string): Promise<BounceEvent[]>;
+  checkReplies?(mailboxEmail: string): Promise<{ email: string; isOptOut: boolean; body: string }[]>;
 }
 
 export interface SeedChecker {
@@ -181,5 +193,5 @@ export interface SeedChecker {
    * Tests seed email placement (INBOX, SPAM, CATEGORY_PROMOTIONS).
    * Note: Promotions is NOT considered spam.
    */
-  checkSeedPlacement(seedEmail: string, campaignId: string, mailboxId: string): Promise<SeedCheckResult>;
+  checkSeedPlacement(seedEmail: string, campaignId: string, mailboxId: string, seedToken?: string): Promise<SeedCheckResult>;
 }

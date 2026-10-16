@@ -1,35 +1,13 @@
-/**
- * Email Blast Engine
- * Handles batching, parallel mailbox sending, signal evaluation,
- * auto-rules enforcement, failover reallocation, and simulation hooks.
- */
-
 import { BLAST_CONFIG } from '@/lib/config/blastConfig';
-import {
-  Campaign,
-  Recipient,
-  BlastDomain,
-  BlastMailbox,
-  BlastEvent,
-  SeedPlacement,
-  MailProvider,
-  BounceSource,
-  SeedChecker,
+import type {
+  Campaign, Recipient, BlastDomain, BlastMailbox, BlastEvent, MailProvider,
+  BounceSource, SeedChecker, SeedPlacement,
 } from '@/lib/types/blast';
-import {
-  defaultMailProvider,
-  defaultBounceSource,
-  defaultSeedChecker,
-  MockBounceSource,
-  MockSeedChecker,
-  getActiveMailProvider,
-  getActiveBounceSource,
-  getActiveSeedChecker,
-} from '@/lib/services/blastProviders';
-import { blastStorage } from '@/lib/services/blastStorage';
-import { isSuppressed } from '@/lib/services/suppression';
+import { getActiveMailProvider, getActiveBounceSource, getActiveSeedChecker } from './blastProviders';
+import { blastStorage } from './blastStorage';
 
 export interface EngineState {
+  revision?: number;
   campaign: Campaign;
   recipients: Recipient[];
   domains: BlastDomain[];
@@ -38,686 +16,396 @@ export interface EngineState {
   seedIndex: number;
   simulationMode: boolean;
   simulationSpeedMultiplier: number;
-  delayedSignalMailboxes: Set<string>;
+  // Arrays survive the browser/worker JSON boundary; Sets do not.
+  delayedSignalMailboxes: string[];
+}
+
+interface EngineOptions {
+  now?: () => number;
+  random?: () => number;
+  storage?: Pick<typeof blastStorage, 'isEmailSuppressed' | 'addSuppression' | 'recordSeedResult'>;
+}
+
+export const mailboxCapacity = (mailbox: BlastMailbox) =>
+  Math.max(0, Math.min(BLAST_CONFIG.HARD_MAX_MAILBOX_DAILY_CAP, mailbox.dailyCap) - mailbox.sentToday);
+
+function localClock(now: number, timeZone: string) {
+  const parts = new Intl.DateTimeFormat('en-CA', {
+    timeZone, year: 'numeric', month: '2-digit', day: '2-digit',
+    hour: '2-digit', minute: '2-digit', hourCycle: 'h23',
+  }).formatToParts(now);
+  const get = (key: string) => parts.find((part) => part.type === key)?.value || '';
+  return { date: `${get('year')}-${get('month')}-${get('day')}`, minutes: Number(get('hour')) * 60 + Number(get('minute')) };
+}
+
+export function inSendingWindow(campaign: Campaign, now: number): boolean {
+  const parse = (value: string) => /^([01]\d|2[0-3]):[0-5]\d$/.test(value)
+    ? Number(value.slice(0, 2)) * 60 + Number(value.slice(3)) : NaN;
+  const start = parse(campaign.sendingWindow.start);
+  const end = parse(campaign.sendingWindow.end);
+  const { minutes } = localClock(now, campaign.sendingWindow.timeZone || 'Asia/Kolkata');
+  return Number.isFinite(start) && Number.isFinite(end) && start < end && minutes >= start && minutes < end;
+}
+
+export function sendingDate(campaign: Campaign, now: number): string {
+  return localClock(now, campaign.sendingWindow.timeZone || 'Asia/Kolkata').date;
 }
 
 export class BlastEngine {
-  private mailProvider: MailProvider;
-  private bounceSource: BounceSource;
-  private seedChecker: SeedChecker;
+  private now: () => number;
+  private random: () => number;
+  private storage: NonNullable<EngineOptions['storage']>;
 
   constructor(
-    mailProvider?: MailProvider,
-    bounceSource?: BounceSource,
-    seedChecker?: SeedChecker
+    private mailProvider: MailProvider = getActiveMailProvider(),
+    private bounceSource: BounceSource = getActiveBounceSource(),
+    private seedChecker: SeedChecker = getActiveSeedChecker(),
+    options: EngineOptions = {},
   ) {
-    this.mailProvider = mailProvider || getActiveMailProvider();
-    this.bounceSource = bounceSource || getActiveBounceSource();
-    this.seedChecker = seedChecker || getActiveSeedChecker();
+    this.now = options.now || Date.now;
+    this.random = options.random || Math.random;
+    this.storage = options.storage || blastStorage;
   }
 
-  // ── ETA & Capacity Calculations ──────────────────────────────────────────
-  /**
-   * Computes remaining daily capacity and multi-day ETA string
-   */
-  computeScheduleETA(
-    recipientCount: number,
-    mailboxes: BlastMailbox[],
-    sendingWindowHours: number = 8
-  ): {
-    totalDailyCapacity: number;
-    daysNeeded: number;
-    etaDescription: string;
-    todayCapacities: { mailboxId: string; cap: number; remaining: number }[];
-  } {
-    const activeMailboxes = mailboxes.filter((m) => m.status === 'active');
-    const totalDailyCapacity = activeMailboxes.reduce(
-      (sum, m) => sum + Math.max(0, m.dailyCap - m.sentToday),
-      0
-    );
+  private event(state: EngineState, title: string, description: string, level: BlastEvent['level'] = 'info', mailbox?: BlastMailbox) {
+    state.events.unshift({ id: `evt-${this.now()}-${this.random()}`, campaignId: state.campaign.id,
+      timestamp: this.now(), title, description, level, ...(mailbox ? { mailboxId: mailbox.id, domainId: mailbox.domainId } : {}) });
+  }
 
-    if (totalDailyCapacity <= 0) {
-      return {
-        totalDailyCapacity: 0,
-        daysNeeded: Infinity,
-        etaDescription: 'No active mailbox capacity available today.',
-        todayCapacities: [],
-      };
-    }
-
-    const todayCapacities = activeMailboxes.map((m) => ({
-      mailboxId: m.id,
-      cap: m.dailyCap,
-      remaining: Math.max(0, m.dailyCap - m.sentToday),
-    }));
-
-    if (recipientCount <= totalDailyCapacity) {
-      // Sends today within window
-      const fractionOfDay = recipientCount / totalDailyCapacity;
-      const hours = Math.max(1, Math.round(fractionOfDay * sendingWindowHours));
-      return {
-        totalDailyCapacity,
-        daysNeeded: 1,
-        etaDescription: `${recipientCount} emails: about ${hours} hour${hours === 1 ? '' : 's'} today.`,
-        todayCapacities,
-      };
-    }
-
-    const daysNeeded = Math.ceil(recipientCount / (activeMailboxes.reduce((s, m) => s + m.dailyCap, 0) || 1));
+  private clone(state: EngineState): EngineState {
     return {
-      totalDailyCapacity,
-      daysNeeded,
-      etaDescription: `${recipientCount} emails: about ${daysNeeded} days (exceeds single-day capacity of ${totalDailyCapacity}).`,
-      todayCapacities,
+      ...state, campaign: { ...state.campaign }, recipients: state.recipients.map((r) => ({ ...r })),
+      domains: state.domains.map((d) => ({ ...d })),
+      mailboxes: state.mailboxes.map((m) => ({ ...m, recentSeedPlacements: [...m.recentSeedPlacements], pendingSeedProbes: [...(m.pendingSeedProbes || [])] })),
+      events: [...state.events], delayedSignalMailboxes: [...(state.delayedSignalMailboxes || [])],
     };
   }
 
-  // ── Recipient Initial Allocation ─────────────────────────────────────────
-  /**
-   * Splits recipients equally across active mailboxes respecting caps.
-   */
-  distributeRecipients(
-    recipients: Recipient[],
-    mailboxes: BlastMailbox[]
-  ): { updatedRecipients: Recipient[]; updatedMailboxes: BlastMailbox[] } {
+  computeScheduleETA(recipientCount: number, mailboxes: BlastMailbox[], sendingWindowHours = 8) {
     const active = mailboxes.filter((m) => m.status === 'active');
-    if (active.length === 0) return { updatedRecipients: recipients, updatedMailboxes: mailboxes };
+    const totalDailyCapacity = active.reduce((sum, m) => sum + mailboxCapacity(m), 0);
+    const nextDayCapacity = active.reduce((sum, m) => sum + Math.min(m.dailyCap, 50), 0);
+    const daysNeeded = recipientCount <= totalDailyCapacity ? 1
+      : nextDayCapacity ? 1 + Math.ceil((recipientCount - totalDailyCapacity) / nextDayCapacity) : Infinity;
+    return {
+      totalDailyCapacity, daysNeeded,
+      etaDescription: !totalDailyCapacity ? 'No active mailbox capacity available today.' : daysNeeded === 1
+        ? `${recipientCount} emails: about ${Math.max(1, Math.ceil(recipientCount / totalDailyCapacity * sendingWindowHours))} hours today (estimate, including seed capacity).`
+        : `${recipientCount} emails: at least ${daysNeeded} sending days; seed probes also use daily capacity.`,
+      todayCapacities: active.map((m) => ({ mailboxId: m.id, cap: Math.min(m.dailyCap, 50), remaining: mailboxCapacity(m) })),
+    };
+  }
 
-    const allocationCount: Record<string, number> = {};
-    active.forEach((m) => (allocationCount[m.id] = 0));
+  distributeRecipients(recipients: Recipient[], mailboxes: BlastMailbox[]) {
+    const active = mailboxes.filter((m) => m.status === 'active');
+    let index = 0;
+    const updatedRecipients = recipients.map((r) => r.status !== 'pending' || r.sentAt || !active.length
+      ? { ...r } : { ...r, mailboxId: active[index++ % active.length].id });
+    return { updatedRecipients, updatedMailboxes: mailboxes.map((m) => ({ ...m,
+      assignedRecipientCount: updatedRecipients.filter((r) => r.status === 'pending' && r.mailboxId === m.id).length })) };
+  }
 
-    let activeIdx = 0;
+  analyzeRootCause(mailboxes: BlastMailbox[]) {
+    const flagged = mailboxes.filter((m) => m.healthFlaggedAt !== undefined);
+    return flagged.length === 1 ? 'Isolated mailbox health failure.'
+      : 'No healthy sending capacity remains. Review seed placement, bounce signals, and domain health.';
+  }
+
+  reallocateUnsentRecipients(recipients: Recipient[], mailboxes: BlastMailbox[], events: BlastEvent[], campaignId: string, domains?: BlastDomain[]) {
+    const allowedDomain = (m: BlastMailbox) => !domains || domains.some((d) => d.id === m.domainId && d.status !== 'paused');
+    const updatedMailboxes = mailboxes.map((m) => ({ ...m }));
+    const blocked = new Set(updatedMailboxes.filter((m) => m.status === 'paused' || m.status === 'cooldown' || !allowedDomain(m)).map((m) => m.id));
+    const orphaned = recipients.filter((r) => r.status === 'pending' && !r.sentAt && (!r.mailboxId || blocked.has(r.mailboxId)));
+    const updatedEvents = [...events];
+    const addEvent = (title: string, description: string, level: BlastEvent['level']) => {
+      if (!updatedEvents.some((event) => event.title === title && event.description === description)) updatedEvents.unshift({
+        id: `failover-${this.now()}-${this.random()}`, campaignId, timestamp: this.now(), title, description, level,
+      });
+    };
+    // Reserve daily slots for work already assigned before moving any additional work.
+    const reserved = (id: string) => recipients.filter((r) => r.status === 'pending' && !r.sentAt && r.mailboxId === id).length;
+    const free = (m: BlastMailbox) => Math.max(0, mailboxCapacity(m) - reserved(m.id));
+    const active = updatedMailboxes.filter((m) => m.status === 'active' && allowedDomain(m) && mailboxCapacity(m) > 0);
+    let spare = updatedMailboxes.find((m) => m.status === 'spare' && allowedDomain(m) && mailboxCapacity(m) > 0 && (!m.cooldownUntil || m.cooldownUntil <= this.now()));
+    if (orphaned.length && spare) {
+      spare.status = 'active';
+      active.unshift(spare);
+      addEvent('Spare Mailbox Activated', `${spare.email} activated for pending recipients. Its own daily limit still applies.`, 'success');
+    }
+    const slots = new Map(active.map((m) => [m.id, free(m)]));
+    let moved = 0;
     const updatedRecipients = recipients.map((r) => {
-      if (r.status !== 'pending' && r.mailboxId) return r;
-
-      const targetMailbox = active[activeIdx % active.length];
-      activeIdx++;
-      allocationCount[targetMailbox.id] = (allocationCount[targetMailbox.id] || 0) + 1;
-
-      return {
-        ...r,
-        mailboxId: targetMailbox.id,
-        status: 'pending' as const,
-      };
+      if (r.status !== 'pending' || r.sentAt || (r.mailboxId && !blocked.has(r.mailboxId))) return { ...r };
+      const target = active.find((m) => (slots.get(m.id) || 0) > 0);
+      if (!target) return { ...r };
+      slots.set(target.id, slots.get(target.id)! - 1);
+      moved++;
+      return { ...r, mailboxId: target.id, leaseExpiresAt: undefined, leaseWorkerId: undefined };
     });
-
-    const updatedMailboxes = mailboxes.map((m) => ({
-      ...m,
-      assignedRecipientCount: allocationCount[m.id] || 0,
-    }));
-
-    return { updatedRecipients, updatedMailboxes };
+    for (const m of updatedMailboxes) m.assignedRecipientCount = updatedRecipients.filter((r) => r.status === 'pending' && r.mailboxId === m.id).length;
+    if (moved) addEvent('Auto-Reallocation Complete', `${moved} unsent recipients moved to healthy mailboxes. Sent and in-flight recipients were left unchanged.`, 'info');
+    if (orphaned.length > moved) addEvent('Recipients Held Pending', `${orphaned.length - moved} recipients remain queued until healthy mailbox capacity is available.`, 'warn');
+    const hasFreeCapacity = active.some((m) => mailboxCapacity(m) > 0);
+    if (!hasFreeCapacity && orphaned.length) addEvent('No Healthy Mailbox Available', 'Sending stopped. No healthy mailbox or eligible spare has capacity.', 'error');
+    return { updatedRecipients, updatedMailboxes, updatedEvents, hasFreeCapacity };
   }
 
-  // ── Auto Rules & Root Cause Analysis ─────────────────────────────────────
-  /**
-   * Evaluates root cause hint based on failure patterns across mailboxes
-   */
-  analyzeRootCause(mailboxes: BlastMailbox[]): string {
-    const paused = mailboxes.filter((m) => m.status === 'paused' || m.status === 'cooldown');
-    const total = mailboxes.filter((m) => m.status !== 'spare').length;
-
-    if (paused.length === 0) return 'All mailboxes healthy';
-    if (paused.length === 1) {
-      return 'Mailbox problem: isolated to this specific mailbox sender reputation or auth config.';
+  private counters(state: EngineState) {
+    for (const m of state.mailboxes) m.assignedRecipientCount = state.recipients.filter((r) => r.status === 'pending' && r.mailboxId === m.id).length;
+    const campaign = state.campaign;
+    campaign.sentCount = state.recipients.filter((r) => r.status === 'sent').length;
+    campaign.bouncedCount = state.recipients.filter((r) => r.status === 'bounced').length;
+    campaign.skippedCount = state.recipients.filter((r) => r.status === 'skipped').length;
+    campaign.pendingCount = state.recipients.filter((r) => r.status === 'pending' || r.status === 'sending').length;
+    campaign.updatedAt = this.now();
+    if (!campaign.pendingCount && !state.mailboxes.some((m) => m.status === 'active' && (m.signalCheckAt || m.pendingSeedProbes?.length)) && campaign.status === 'running') {
+      campaign.status = 'completed';
+      campaign.completedAt = this.now();
     }
-    if (paused.length >= total) {
-      return 'List or domain problem: high-risk recipient list, spam trap hit, or root domain blacklist.';
-    }
-    return 'Content problem: same message copy/links triggering spam filters across multiple mailboxes.';
+    state.events = state.events.slice(0, 500);
   }
 
-  // ── Auto Reallocation on Mailbox/Domain Pause ─────────────────────────────
-  /**
-   * Moves ONLY unsent recipients from paused/cooldown mailboxes to healthy mailboxes
-   * with remaining capacity. Never resends to anyone already sent!
-   */
-  reallocateUnsentRecipients(
-    recipients: Recipient[],
-    mailboxes: BlastMailbox[],
-    events: BlastEvent[],
-    campaignId: string
-  ): {
-    updatedRecipients: Recipient[];
-    updatedMailboxes: BlastMailbox[];
-    updatedEvents: BlastEvent[];
-    hasFreeCapacity: boolean;
-  } {
-    const healthyMailboxes = mailboxes.filter(
-      (m) => m.status === 'active' && m.dailyCap - m.sentToday > 0
-    );
-
-    const pausedMailboxIds = new Set(
-      mailboxes.filter((m) => m.status === 'paused' || m.status === 'cooldown').map((m) => m.id)
-    );
-
-    const orphanedRecipients = recipients.filter(
-      (r) => r.status === 'pending' && r.mailboxId && pausedMailboxIds.has(r.mailboxId)
-    );
-
-    if (orphanedRecipients.length === 0) {
-      return {
-        updatedRecipients: recipients,
-        updatedMailboxes: mailboxes,
-        updatedEvents: events,
-        hasFreeCapacity: healthyMailboxes.length > 0,
-      };
-    }
-
-    if (healthyMailboxes.length === 0) {
-      // No healthy mailbox with free capacity: stop sending, keep pending, alert
-      const alertEvent: BlastEvent = {
-        id: `evt-${Date.now()}-${Math.random()}`,
-        campaignId,
-        timestamp: Date.now(),
-        level: 'error',
-        title: 'No Healthy Mailbox Available',
-        description: `${orphanedRecipients.length} unsent emails held as pending. All healthy mailbox capacities exhausted.`,
-        rootCauseHint: 'Capacity depleted across all active mailboxes.',
-      };
-
-      return {
-        updatedRecipients: recipients,
-        updatedMailboxes: mailboxes,
-        updatedEvents: [alertEvent, ...events],
-        hasFreeCapacity: false,
-      };
-    }
-
-    // Reallocate evenly across healthy mailboxes
-    let healthyIdx = 0;
-    const reallocatedRecipients = recipients.map((r) => {
-      if (r.status === 'pending' && r.mailboxId && pausedMailboxIds.has(r.mailboxId)) {
-        const target = healthyMailboxes[healthyIdx % healthyMailboxes.length];
-        healthyIdx++;
-        return {
-          ...r,
-          mailboxId: target.id,
-        };
-      }
-      return r;
-    });
-
-    // Recompute assignedRecipientCount
-    const countMap: Record<string, number> = {};
-    reallocatedRecipients.forEach((r) => {
-      if (r.status === 'pending' && r.mailboxId) {
-        countMap[r.mailboxId] = (countMap[r.mailboxId] || 0) + 1;
-      }
-    });
-
-    const updatedMailboxes = mailboxes.map((m) => ({
-      ...m,
-      assignedRecipientCount: countMap[m.id] || 0,
-    }));
-
-    const moveEvent: BlastEvent = {
-      id: `evt-${Date.now()}-${Math.random()}`,
-      campaignId,
-      timestamp: Date.now(),
-      level: 'info',
-      title: 'Auto-Reallocation Complete',
-      description: `Moved ${orphanedRecipients.length} unsent emails to ${healthyMailboxes.length} healthy mailbox(es). Already sent emails remain untouched.`,
-      rootCauseHint: 'Auto-reallocation safeguard active.',
-    };
-
-    return {
-      updatedRecipients: reallocatedRecipients,
-      updatedMailboxes,
-      updatedEvents: [moveEvent, ...events],
-      hasFreeCapacity: true,
-    };
-  }
-
-  // ── Batch Processing Step (Single Mailbox Tick) ──────────────────────────
-  /**
-   * Executes one batch cycle for an active mailbox:
-   * 1. Checks suppression list
-   * 2. Sends batch of 10-15 (or 5 if backoff) with gap
-   * 3. Seed check every ~11th email
-   * 4. Evaluates bounces & seed signals
-   * 5. Enforces auto-rules (bounce >3%, spam 2-of-3, domain failure)
-   */
-  async processMailboxBatch(
-    mailboxId: string,
-    state: EngineState
-  ): Promise<{
-    updatedState: EngineState;
-    sentThisBatch: number;
-    bouncedThisBatch: number;
-  }> {
-    const { campaign, domains, mailboxes, recipients, events } = state;
-    const mailbox = mailboxes.find((m) => m.id === mailboxId);
-    if (!mailbox || mailbox.status !== 'active') {
-      return { updatedState: state, sentThisBatch: 0, bouncedThisBatch: 0 };
-    }
-
-    const domain = domains.find((d) => d.id === mailbox.domainId);
-    if (!domain || domain.status === 'paused') {
-      return { updatedState: state, sentThisBatch: 0, bouncedThisBatch: 0 };
-    }
-
-    // Daily cap enforcement
-    const remainingCap = Math.max(0, mailbox.dailyCap - mailbox.sentToday);
-    if (remainingCap <= 0) {
-      return { updatedState: state, sentThisBatch: 0, bouncedThisBatch: 0 };
-    }
-
-    // Determine batch size (Backoff safeguard if signals are delayed)
-    const isBackoff = Boolean(mailbox.backoffActive || state.delayedSignalMailboxes.has(mailbox.id));
-    const rawBatchSize = isBackoff
-      ? BLAST_CONFIG.BACKOFF_BATCH_SIZE
-      : Math.floor(
-          Math.random() * (BLAST_CONFIG.BATCH_SIZE_MAX - BLAST_CONFIG.BATCH_SIZE_MIN + 1)
-        ) + BLAST_CONFIG.BATCH_SIZE_MIN;
-
-    const batchSize = Math.min(rawBatchSize, remainingCap);
-
-    // Get pending recipients for this mailbox
-    const pendingForMailbox = recipients.filter(
-      (r) => r.mailboxId === mailbox.id && r.status === 'pending'
-    );
-
-    if (pendingForMailbox.length === 0) {
-      return { updatedState: state, sentThisBatch: 0, bouncedThisBatch: 0 };
-    }
-
-    const currentBatchRecipients = pendingForMailbox.slice(0, batchSize);
-
-    // Track state modifications
-    const updatedRecipients = [...recipients];
-    let newEvents = [...events];
-    let sentCount = 0;
-    let bouncedCount = 0;
-    let newSeedIndex = state.seedIndex;
-
-    // Send emails in batch with gap
-    for (const r of currentBatchRecipients) {
-      const idx = updatedRecipients.findIndex((rec) => rec.id === r.id);
-      if (idx === -1) continue;
-
-      // 1. Suppression check before send
-      const suppressedLocally = await isSuppressed(r.email);
-      const suppressedFirestore = await blastStorage.isEmailSuppressed(r.email);
-
-      if (suppressedLocally || suppressedFirestore) {
-        updatedRecipients[idx] = {
-          ...r,
-          status: 'skipped',
-          skipReason: 'Present on suppression list (unsubscribed or prior bounce)',
-        };
-        continue;
-      }
-
-      // 2. Mock send with List-Unsubscribe header
-      const sendResult = await this.mailProvider.sendEmail({
-        fromEmail: mailbox.email,
-        fromName: campaign.senderName || mailbox.displayName,
-        toEmail: r.email,
-        toName: r.name,
-        subject: campaign.subject,
-        body: campaign.body,
-      });
-
-      if (sendResult.success) {
-        updatedRecipients[idx] = {
-          ...r,
-          status: 'sent',
-          sentAt: Date.now(),
-        };
-        sentCount++;
-      }
-
-      // 3. Seed check every ~11th email
-      const totalMailboxSent = mailbox.totalSent + sentCount;
-      if (totalMailboxSent % BLAST_CONFIG.SEED_INTERVAL === 0) {
-        const seedAddresses = BLAST_CONFIG.DEFAULT_SEEDS;
-        const targetSeed = seedAddresses[newSeedIndex % seedAddresses.length];
-        newSeedIndex++;
-
-        const seedResult = await this.seedChecker.checkSeedPlacement(
-          targetSeed,
-          campaign.id,
-          mailbox.id
-        );
-
-        await blastStorage.recordSeedResult(seedResult);
-
-        // Update recent seed placements
-        const currentPlacements = [...mailbox.recentSeedPlacements, seedResult.placement].slice(
-          -BLAST_CONFIG.SEED_SPAM_CHECK_WINDOW
-        );
-
-        mailbox.recentSeedPlacements = currentPlacements;
-
-        newEvents.unshift({
-          id: `seed-${Date.now()}-${Math.random()}`,
-          campaignId: campaign.id,
-          timestamp: Date.now(),
-          level: seedResult.placement === 'spam' ? 'warn' : 'info',
-          title: `Seed Placement: ${seedResult.placement.toUpperCase()}`,
-          description: `Seed address ${targetSeed} tested via ${mailbox.displayName}: placed in ${seedResult.placement} (Promotions is NOT spam).`,
-          mailboxId: mailbox.id,
-          domainId: mailbox.domainId,
-        });
-      }
-    }
-
-    // 4. Evaluate late or current bounce signals
-    const bounces = await this.bounceSource.getBounces(mailbox.id);
-    if (bounces.length > 0) {
-      for (const b of bounces) {
-        const isSoft = b.type === 'soft';
-        const rIdx = updatedRecipients.findIndex((r) => r.email === b.email);
-        const currentRecipient = rIdx !== -1 ? updatedRecipients[rIdx] : null;
-        const softTries = (currentRecipient?.softBounceCount || 0) + 1;
-
-        if (isSoft && softTries <= BLAST_CONFIG.MAX_SOFT_BOUNCE_RETRIES) {
-          // Soft bounce: retry later at most twice
-          if (rIdx !== -1) {
-            updatedRecipients[rIdx] = {
-              ...updatedRecipients[rIdx],
-              status: 'pending',
-              softBounceCount: softTries,
-              bounceReason: `Soft Bounce (${b.statusCode || '4.x.x'}): ${b.reason} (Attempt ${softTries}/${BLAST_CONFIG.MAX_SOFT_BOUNCE_RETRIES})`,
-            };
-          }
-
-          newEvents.unshift({
-            id: `soft-bounce-${Date.now()}-${Math.random()}`,
-            campaignId: campaign.id,
-            timestamp: Date.now(),
-            level: 'warn',
-            title: 'Soft Bounce (Scheduled for Retry)',
-            description: `${b.email} soft-bounced on ${mailbox.displayName}. Retry ${softTries}/${BLAST_CONFIG.MAX_SOFT_BOUNCE_RETRIES} will be attempted later.`,
-            mailboxId: mailbox.id,
-            domainId: mailbox.domainId,
-          });
-        } else {
-          // Hard bounce (5.x.x) or exhausted soft bounce retries
-          bouncedCount++;
-          await blastStorage.addSuppression(b.email, b.reason);
-
-          if (rIdx !== -1) {
-            updatedRecipients[rIdx] = {
-              ...updatedRecipients[rIdx],
-              status: 'bounced',
-              bounceReason: b.reason,
-            };
-          }
-
-          newEvents.unshift({
-            id: `bounce-${Date.now()}-${Math.random()}`,
-            campaignId: campaign.id,
-            timestamp: Date.now(),
-            level: 'error',
-            title: isSoft ? 'Soft Bounce Limit Exceeded' : 'Hard Bounce Detected',
-            description: `Recipient ${b.email} bounced on ${mailbox.displayName}: ${b.reason}. Address added to suppression list.`,
-            mailboxId: mailbox.id,
-            domainId: mailbox.domainId,
-          });
+  private resetDay(state: EngineState) {
+    const date = localClock(this.now(), state.campaign.sendingWindow.timeZone || 'Asia/Kolkata').date;
+    for (const m of state.mailboxes) {
+      if (m.dailyResetDate && m.dailyResetDate !== date) {
+        if (m.status === 'active' && !m.backoffActive && !m.signalCheckAt && m.sentToday > 0 && state.campaign.enableRamp) {
+          const percent = Math.max(10, Math.min(20, state.campaign.rampPercent || 15));
+          m.dailyCap = Math.min(50, Math.floor(m.dailyCap * (1 + percent / 100)));
         }
+        m.sentToday = 0;
+      }
+      m.dailyResetDate = date;
+      m.dailyCap = Math.max(1, Math.min(50, m.dailyCap));
+    }
+  }
+
+  private enforceRules(state: EngineState): EngineState {
+    let needsFailover = false;
+    for (const m of state.mailboxes) {
+      const sent = m.totalSent - (m.healthSentBaseline || 0);
+      const bounced = m.bouncesCount - (m.healthBounceBaseline || 0);
+      m.bounceRate = sent > 0 ? Number((bounced / sent * 100).toFixed(2)) : 0;
+      const spam = m.recentSeedPlacements.slice(-3).filter((p) => p === 'spam').length >= 2;
+      const bounce = sent >= 50 && bounced / sent * 100 > 3;
+      if (m.status === 'active' && (spam || bounce)) {
+        m.status = 'paused';
+        m.healthFlaggedAt = this.now();
+        m.cooldownUntil = this.now() + BLAST_CONFIG.COOLDOWN_HOURS_DEFAULT * 3600000;
+        m.batchSentCount = 0;
+        m.nextSendAt = undefined;
+        this.event(state, spam ? 'Mailbox Paused (Spam Placement)' : 'Mailbox Paused (High Bounce Rate)',
+          `${m.email}: ${spam ? '2 of the last 3 seed results were spam' : `bounce rate ${m.bounceRate}% after ${sent} sends`}. Cooldown: 48 hours.`, 'warn', m);
+        needsFailover = true;
       }
     }
-
-    // 5. Update Mailbox metrics
-    mailbox.sentToday += sentCount;
-    mailbox.totalSent += sentCount;
-    mailbox.bouncesCount += bouncedCount;
-    mailbox.bounceRate =
-      mailbox.totalSent > 0
-        ? parseFloat(((mailbox.bouncesCount / mailbox.totalSent) * 100).toFixed(2))
-        : 0;
-    mailbox.lastSignalReceivedAt = Date.now();
-
-    // 6. AUTO-RULES EVALUATION
-    let mailboxPaused = false;
-    let pauseReason = '';
-
-    // Rule A: Seed lands in spam 2 of last 3 -> pause mailbox, domain 'watch'
-    const recentSpams = mailbox.recentSeedPlacements.filter((p) => p === 'spam').length;
-    if (recentSpams >= BLAST_CONFIG.SEED_SPAM_FAIL_COUNT) {
-      mailboxPaused = true;
-      pauseReason = `Seed landed in spam ${recentSpams} of last ${BLAST_CONFIG.SEED_SPAM_CHECK_WINDOW} tests.`;
-      mailbox.status = 'paused';
-      mailbox.cooldownUntil = Date.now() + BLAST_CONFIG.COOLDOWN_HOURS_DEFAULT * 3600 * 1000;
-
-      // Mark domain as "watch"
-      domain.status = 'watch';
-      domain.flaggedMailboxCount = (domain.flaggedMailboxCount || 0) + 1;
-
-      newEvents.unshift({
-        id: `rule-seed-${Date.now()}-${Math.random()}`,
-        campaignId: campaign.id,
-        timestamp: Date.now(),
-        level: 'warn',
-        title: 'Mailbox Paused (Spam Placement)',
-        description: `${mailbox.displayName} paused: ${pauseReason} Domain ${domain.name} marked on WATCH. Cooldown: ${BLAST_CONFIG.COOLDOWN_HOURS_DEFAULT}h.`,
-        mailboxId: mailbox.id,
-        domainId: domain.id,
-        rootCauseHint: 'Mailbox problem: isolated spam placement on this sender.',
-      });
-    }
-
-    // Rule B: Bounce rate above 3% once at least 50 emails sent -> pause mailbox
-    if (
-      mailbox.totalSent >= BLAST_CONFIG.BOUNCE_RATE_MIN_SENT_EMAILS &&
-      mailbox.bounceRate > BLAST_CONFIG.BOUNCE_RATE_THRESHOLD_PERCENT
-    ) {
-      mailboxPaused = true;
-      pauseReason = `Bounce rate exceeded 3% (${mailbox.bounceRate}% across ${mailbox.totalSent} sends).`;
-      mailbox.status = 'paused';
-      mailbox.cooldownUntil = Date.now() + BLAST_CONFIG.COOLDOWN_HOURS_DEFAULT * 3600 * 1000;
-
-      newEvents.unshift({
-        id: `rule-bounce-${Date.now()}-${Math.random()}`,
-        campaignId: campaign.id,
-        timestamp: Date.now(),
-        level: 'error',
-        title: 'Mailbox Paused (High Bounce Rate)',
-        description: `${mailbox.displayName} paused: ${pauseReason} Cooldown: ${BLAST_CONFIG.COOLDOWN_HOURS_DEFAULT}h.`,
-        mailboxId: mailbox.id,
-        domainId: domain.id,
-        rootCauseHint: 'Recipient list quality issue or invalid contact addresses.',
-      });
-    }
-
-    // Rule C: 2 or more mailboxes flagged on one domain -> pause that whole domain
-    const flaggedOnDomain = mailboxes.filter(
-      (m) => m.domainId === domain.id && (m.status === 'paused' || m.status === 'cooldown')
-    ).length;
-
-    if (flaggedOnDomain >= BLAST_CONFIG.DOMAIN_FLAGGED_MAILBOXES_LIMIT) {
-      domain.status = 'paused';
-      newEvents.unshift({
-        id: `rule-domain-${Date.now()}-${Math.random()}`,
-        campaignId: campaign.id,
-        timestamp: Date.now(),
-        level: 'error',
-        title: 'Domain Paused',
-        description: `Domain ${domain.name} automatically paused: ${flaggedOnDomain} mailboxes flagged.`,
-        domainId: domain.id,
-        rootCauseHint: 'Domain reputation block: multiple mailboxes compromised.',
-      });
-    }
-
-    // Rule D: If mailbox or domain paused, execute auto-reallocation of unsent emails
-    let finalRecipients = updatedRecipients;
-    let finalMailboxes = mailboxes.map((m) => (m.id === mailbox.id ? mailbox : m));
-    let finalEvents = newEvents;
-
-    if (mailboxPaused || domain.status === 'paused') {
-      const realloc = this.reallocateUnsentRecipients(
-        finalRecipients,
-        finalMailboxes,
-        finalEvents,
-        campaign.id
-      );
-      finalRecipients = realloc.updatedRecipients;
-      finalMailboxes = realloc.updatedMailboxes;
-      finalEvents = realloc.updatedEvents;
-
-      // Rule E: Check campaign-level root cause
-      const allPaused = finalMailboxes
-        .filter((m) => m.status !== 'spare')
-        .every((m) => m.status === 'paused' || m.status === 'cooldown');
-
-      if (allPaused) {
-        campaign.status = 'alert_paused';
-        campaign.rootCauseHint = this.analyzeRootCause(finalMailboxes);
-        finalEvents.unshift({
-          id: `rule-camp-pause-${Date.now()}-${Math.random()}`,
-          campaignId: campaign.id,
-          timestamp: Date.now(),
-          level: 'error',
-          title: 'Entire Campaign Paused',
-          description: 'All sending mailboxes flagged or paused. Sending halted to protect domain reputation.',
-          rootCauseHint: campaign.rootCauseHint,
-        });
+    for (const domain of state.domains) {
+      const members = state.mailboxes.filter((m) => m.domainId === domain.id);
+      domain.flaggedMailboxCount = members.filter((m) => m.healthFlaggedAt !== undefined).length;
+      if (domain.flaggedMailboxCount >= 2 && domain.status !== 'paused') {
+        domain.status = 'paused';
+        this.event(state, 'Domain Paused', `${domain.name}: two mailboxes flagged. All mailboxes on this domain are blocked.`, 'error');
+      } else if (domain.flaggedMailboxCount && domain.status === 'active') domain.status = 'watch';
+      if (domain.status === 'paused') {
+        for (const m of members) if (m.status === 'active' || m.status === 'spare') m.status = 'paused';
+        needsFailover = true;
       }
     }
-
-    // Update campaign counters
-    const newSentCount = finalRecipients.filter((r) => r.status === 'sent').length;
-    const newBouncedCount = finalRecipients.filter((r) => r.status === 'bounced').length;
-    const newPendingCount = finalRecipients.filter((r) => r.status === 'pending').length;
-    const newSkippedCount = finalRecipients.filter((r) => r.status === 'skipped').length;
-
-    const updatedCampaign: Campaign = {
-      ...campaign,
-      sentCount: newSentCount,
-      bouncedCount: newBouncedCount,
-      pendingCount: newPendingCount,
-      skippedCount: newSkippedCount,
-      status: newPendingCount === 0 && campaign.status === 'running' ? 'completed' : campaign.status,
-      updatedAt: Date.now(),
-      completedAt: newPendingCount === 0 ? Date.now() : undefined,
-    };
-
-    return {
-      updatedState: {
-        ...state,
-        campaign: updatedCampaign,
-        domains: domains.map((d) => (d.id === domain.id ? domain : d)),
-        mailboxes: finalMailboxes,
-        recipients: finalRecipients,
-        events: finalEvents,
-        seedIndex: newSeedIndex,
-      },
-      sentThisBatch: sentCount,
-      bouncedThisBatch: bouncedCount,
-    };
-  }
-
-  // ── Simulation Helpers ───────────────────────────────────────────────────
-  /**
-   * Injects a fake bounce event for a specific mailbox to test auto-rules
-   */
-  injectSimulatedBounce(
-    mailboxId: string,
-    state: EngineState,
-    recipientEmail?: string
-  ): EngineState {
-    const mailbox = state.mailboxes.find((m) => m.id === mailboxId);
-    if (!mailbox) return state;
-
-    const email = recipientEmail || `bounced-user-${Math.floor(Math.random() * 9000 + 1000)}@invalid-domain.xyz`;
-    (this.bounceSource as MockBounceSource).injectBounce({
-      email,
-      mailboxId,
-      domainId: mailbox.domainId,
-      timestamp: Date.now(),
-      type: 'hard',
-      reason: '550 5.1.1 User unknown / Host not found (Simulated Bounce)',
-    });
-
-    const event: BlastEvent = {
-      id: `sim-bounce-${Date.now()}-${Math.random()}`,
-      campaignId: state.campaign.id,
-      timestamp: Date.now(),
-      level: 'warn',
-      title: 'Simulation: Injected Fake Bounce',
-      description: `Injected 550 Hard Bounce for ${email} on ${mailbox.displayName}. Check next evaluation tick.`,
-      mailboxId,
-      domainId: mailbox.domainId,
-    };
-
-    return {
-      ...state,
-      events: [event, ...state.events],
-    };
-  }
-
-  /**
-   * Injects a fake spam placement on seed checks for a specific mailbox
-   */
-  injectSimulatedSpamPlacement(mailboxId: string, state: EngineState): EngineState {
-    const mailbox = state.mailboxes.find((m) => m.id === mailboxId);
-    if (!mailbox) return state;
-
-    (this.seedChecker as MockSeedChecker).injectPlacement(mailboxId, 'spam');
-
-    const event: BlastEvent = {
-      id: `sim-spam-${Date.now()}-${Math.random()}`,
-      campaignId: state.campaign.id,
-      timestamp: Date.now(),
-      level: 'warn',
-      title: 'Simulation: Injected Spam Placement',
-      description: `Forced next seed check for ${mailbox.displayName} to land in SPAM (Test: 2 of last 3 in spam rule).`,
-      mailboxId,
-      domainId: mailbox.domainId,
-    };
-
-    return {
-      ...state,
-      events: [event, ...state.events],
-    };
-  }
-
-  /**
-   * Injects delayed-signal event to test backoff & stale signal alert
-   */
-  injectDelayedSignalEvent(mailboxId: string, state: EngineState): EngineState {
-    const mailbox = state.mailboxes.find((m) => m.id === mailboxId);
-    if (!mailbox) return state;
-
-    const delayedSet = new Set(state.delayedSignalMailboxes);
-    delayedSet.add(mailboxId);
-
-    const updatedMailboxes = state.mailboxes.map((m) =>
-      m.id === mailboxId ? { ...m, backoffActive: true } : m
-    );
-
-    const event: BlastEvent = {
-      id: `sim-delay-${Date.now()}-${Math.random()}`,
-      campaignId: state.campaign.id,
-      timestamp: Date.now(),
-      level: 'warn',
-      title: 'Simulation: Signal Delayed (Backoff Active)',
-      description: `Signals delayed beyond ${BLAST_CONFIG.SIGNAL_DELAY_THRESHOLD_SECONDS}s on ${mailbox.displayName}. Batch reduced to ${BLAST_CONFIG.BACKOFF_BATCH_SIZE} with 2x gap.`,
-      mailboxId,
-      domainId: mailbox.domainId,
-    };
-
-    // If more than 50% mailboxes have delayed signal, trigger campaign pause
-    const activeCount = updatedMailboxes.filter((m) => m.status === 'active').length;
-    let updatedCampaign = state.campaign;
-
-    if (delayedSet.size / (activeCount || 1) >= BLAST_CONFIG.STALE_SIGNAL_RATIO_ALERT_THRESHOLD) {
-      updatedCampaign = {
-        ...state.campaign,
-        status: 'alert_paused',
-        rootCauseHint: 'Signal checker delay alert: most mailboxes have no signal for a long time. The checker may be broken.',
-      };
+    const blocked = new Set(state.mailboxes.filter((m) => m.status === 'paused' || m.status === 'cooldown').map((m) => m.id));
+    needsFailover ||= state.recipients.some((r) => r.status === 'pending' && !r.sentAt && (!r.mailboxId || blocked.has(r.mailboxId)));
+    if (needsFailover) {
+      const result = this.reallocateUnsentRecipients(state.recipients, state.mailboxes, state.events, state.campaign.id, state.domains);
+      state.recipients = result.updatedRecipients;
+      state.mailboxes = result.updatedMailboxes;
+      state.events = result.updatedEvents;
+      if (!result.hasFreeCapacity && state.campaign.status === 'running' && state.recipients.some((r) => r.status === 'pending')) {
+        state.campaign.status = 'alert_paused';
+        state.campaign.rootCauseHint = this.analyzeRootCause(state.mailboxes);
+      }
     }
+    const active = state.mailboxes.filter((m) => m.status === 'active');
+    if (active.length && active.filter((m) => state.delayedSignalMailboxes.includes(m.id)).length / active.length >= 0.5) {
+      state.campaign.status = 'alert_paused';
+      state.campaign.rootCauseHint = 'At least half of active mailboxes have delayed signals. Sending paused until checks recover.';
+    }
+    this.counters(state);
+    return state;
+  }
 
-    return {
-      ...state,
-      campaign: updatedCampaign,
-      mailboxes: updatedMailboxes,
-      delayedSignalMailboxes: delayedSet,
-      events: [event, ...state.events],
-    };
+  resumeMailbox(mailboxId: string, original: EngineState): EngineState {
+    const state = this.clone(original);
+    const m = state.mailboxes.find((mailbox) => mailbox.id === mailboxId);
+    if (!m || state.domains.find((d) => d.id === m.domainId)?.status === 'paused') return original;
+    if (m.cooldownUntil && m.cooldownUntil > this.now()) return original;
+    m.status = 'active';
+    if (m.healthFlaggedAt !== undefined) {
+      m.dailyCap = BLAST_CONFIG.RESUME_DAILY_CAP_INITIAL;
+      m.healthSentBaseline = m.totalSent;
+      m.healthBounceBaseline = m.bouncesCount;
+      m.healthFlaggedAt = undefined;
+      m.recentSeedPlacements = [];
+      m.bounceRate = 0;
+    }
+    m.cooldownUntil = undefined;
+    this.event(state, 'Mailbox Resumed', `${m.email} resumed at ${m.dailyCap}/day.`, 'info', m);
+    return this.enforceRules(state);
+  }
+
+  private delay(seconds: number, state: EngineState) {
+    return seconds * 1000 / (state.simulationMode ? Math.max(1, Math.min(120, state.simulationSpeedMultiplier || 1)) : 1);
+  }
+
+  /** One due operation per tick. Deadlines avoid multi-minute requests and sleeps. */
+  async processMailboxBatch(mailboxId: string, original: EngineState) {
+    let state = this.clone(original);
+    this.resetDay(state);
+    state = this.enforceRules(state);
+    let sentThisBatch = 0;
+    let bouncedThisBatch = 0;
+    const result = () => { this.counters(state); return { updatedState: state, sentThisBatch, bouncedThisBatch }; };
+    if (state.campaign.status !== 'running' && state.campaign.status !== 'alert_paused') return result();
+    let mailbox = state.mailboxes.find((m) => m.id === mailboxId);
+    if (!mailbox || mailbox.status !== 'active' || state.domains.find((d) => d.id === mailbox!.domainId)?.status === 'paused') return result();
+    const now = this.now();
+    if (mailbox.signalCheckAt) {
+      if (now < mailbox.signalCheckAt) return result();
+      try {
+        const sourceId = state.simulationMode ? mailbox.id : mailbox.email;
+        const bounces = await this.bounceSource.getBounces(sourceId);
+        for (const bounce of bounces) {
+          const recipient = state.recipients.find((r) => r.mailboxId === mailboxId && r.email.toLowerCase() === bounce.email.toLowerCase() && r.status === 'sent');
+          if (!recipient) continue; // Ignore unrelated and already-processed notifications.
+          mailbox.bouncesCount++;
+          bouncedThisBatch++;
+          recipient.status = 'bounced';
+          recipient.bounceReason = bounce.reason;
+          if (bounce.type === 'hard') await this.storage.addSuppression(bounce.email, bounce.reason);
+          this.event(state, 'Bounce Detected', `${bounce.email}: ${bounce.reason}`, 'warn', mailbox);
+        }
+        const replies = await this.bounceSource.checkReplies?.(mailbox.email) || [];
+        for (const reply of replies) {
+          if (!state.recipients.some((r) => r.email.toLowerCase() === reply.email.toLowerCase())) continue;
+          await this.storage.addSuppression(reply.email, reply.isOptOut ? 'Recipient requested STOP' : 'Recipient replied');
+          for (const r of state.recipients) if (r.status === 'pending' && r.email.toLowerCase() === reply.email.toLowerCase()) {
+            r.status = 'skipped'; r.skipReason = 'Recipient replied or opted out';
+          }
+        }
+        for (const probe of [...(mailbox.pendingSeedProbes || [])]) {
+          const seed = await this.seedChecker.checkSeedPlacement(probe.email, state.campaign.id, sourceId, probe.token);
+          mailbox.recentSeedPlacements = [...mailbox.recentSeedPlacements, seed.placement].slice(-3);
+          mailbox.pendingSeedProbes = mailbox.pendingSeedProbes!.filter((p) => p.token !== probe.token);
+          await this.storage.recordSeedResult(seed);
+          this.event(state, `Seed Placement: ${seed.placement.toUpperCase()}`, `${probe.email}: ${seed.placement}`, seed.placement === 'spam' ? 'warn' : 'info', mailbox);
+        }
+        mailbox.lastSignalReceivedAt = now;
+        mailbox.backoffActive = false;
+        state.delayedSignalMailboxes = state.delayedSignalMailboxes.filter((id) => id !== mailboxId);
+        mailbox.signalCheckAt = undefined;
+        mailbox.batchSentCount = 0;
+        mailbox.batchTarget = undefined;
+      } catch {
+        mailbox.backoffActive = true;
+        if (!state.delayedSignalMailboxes.includes(mailboxId)) state.delayedSignalMailboxes.push(mailboxId);
+        mailbox.signalCheckAt = now + this.delay(BLAST_CONFIG.SIGNAL_EVALUATION_WAIT_SECONDS, state);
+        this.event(state, 'Signal Check Delayed', `${mailbox.email}: signal lookup failed; no successful placement has been assumed.`, 'warn', mailbox);
+      }
+      state = this.enforceRules(state);
+      return result();
+    }
+    if (state.campaign.status !== 'running' || !mailboxCapacity(mailbox) || (mailbox.nextSendAt || 0) > now) return result();
+    if (!state.simulationMode && !inSendingWindow(state.campaign, now)) return result();
+    const pending = state.recipients.find((r) => r.mailboxId === mailboxId && r.status === 'pending' && !r.sentAt);
+    if (!pending) return result();
+    const seeds = state.simulationMode ? BLAST_CONFIG.DEFAULT_SEEDS : BLAST_CONFIG.LIVE_SEEDS;
+    const isSeed = (mailbox.recipientSendsSinceSeed || 0) >= BLAST_CONFIG.SEED_INTERVAL - 1;
+    if (!state.simulationMode && (!seeds.length || !state.campaign.senderName.trim() || !state.campaign.businessAddress.trim() || !state.campaign.optOutText.trim())) {
+      state.campaign.status = 'alert_paused';
+      state.campaign.rootCauseHint = 'Live sending requires configured seed inboxes, sender name, business address, and opt-out text.';
+      return result();
+    }
+    try {
+      if (!isSeed && await this.storage.isEmailSuppressed(pending.email)) {
+        pending.status = 'skipped'; pending.skipReason = 'Recipient is suppressed';
+        return result();
+      }
+    } catch {
+      state.campaign.status = 'alert_paused';
+      state.campaign.rootCauseHint = 'Suppression lookup failed. Sending paused until the list can be checked.';
+      return result();
+    }
+    const seedEmail = seeds[state.seedIndex % seeds.length];
+    const seedToken = isSeed ? `seed-${state.campaign.id}-${mailbox.id}-${now}-${Math.floor(this.random() * 1e9)}` : undefined;
+    const footer = `\n\n${state.campaign.senderName}\n${state.campaign.businessAddress}\n${state.campaign.optOutText}`;
+    try {
+      const sent = await this.mailProvider.sendEmail({
+        fromEmail: mailbox.email, fromName: state.campaign.senderName || mailbox.displayName,
+        replyTo: mailbox.email, toEmail: isSeed ? seedEmail : pending.email, toName: isSeed ? undefined : pending.name,
+        subject: isSeed ? `${state.campaign.subject} [${seedToken}]` : state.campaign.subject,
+        body: state.campaign.body + footer, campaignId: state.campaign.id,
+        recipientId: isSeed ? seedToken : pending.id, seedToken,
+      });
+      if (!sent.success) throw new Error('Provider did not confirm delivery');
+      mailbox.sentToday++;
+      mailbox.totalSent++;
+      mailbox.batchSentCount = (mailbox.batchSentCount || 0) + 1;
+      if (isSeed) {
+        mailbox.pendingSeedProbes!.push({ email: seedEmail, token: seedToken! });
+        mailbox.recipientSendsSinceSeed = 0;
+        state.seedIndex++;
+      } else {
+        pending.status = 'sent'; pending.sentAt = now; pending.messageId = sent.messageId;
+        mailbox.recipientSendsSinceSeed = (mailbox.recipientSendsSinceSeed || 0) + 1;
+        sentThisBatch = 1;
+      }
+      mailbox.batchTarget ||= mailbox.backoffActive ? 5 : 10 + Math.floor(this.random() * 6);
+      const gap = (30 + Math.floor(this.random() * 91)) * (mailbox.backoffActive ? 2 : 1);
+      mailbox.nextSendAt = now + this.delay(gap, state);
+      if (mailbox.batchSentCount >= mailbox.batchTarget || !mailboxCapacity(mailbox) || !state.recipients.some((r) => r.status === 'pending' && r.mailboxId === mailboxId)) {
+        mailbox.signalCheckAt = now + this.delay(120, state);
+        this.event(state, 'Batch Waiting for Signals', `${mailbox.email}: ${mailbox.batchSentCount} messages sent; waiting 2 minutes before signal evaluation${state.simulationMode ? ' (accelerated simulation)' : ''}.`, 'info', mailbox);
+      }
+    } catch {
+      // Do not automatically resend after an ambiguous transport failure.
+      if (!isSeed) { pending.status = 'sending'; pending.skipReason = 'Delivery outcome unknown; review before retrying'; }
+      state.campaign.status = 'alert_paused';
+      state.campaign.rootCauseHint = 'Mail transport failed. Campaign paused for delivery review to avoid duplicate sends.';
+      this.event(state, 'Sending Failed', state.campaign.rootCauseHint, 'error', mailbox);
+    }
+    state = this.enforceRules(state);
+    return result();
+  }
+
+  injectSimulatedBounce(mailboxId: string, original: EngineState, recipientEmail?: string): EngineState {
+    if (!original.simulationMode) return original;
+    const state = this.clone(original);
+    const mailbox = state.mailboxes.find((m) => m.id === mailboxId);
+    const r = state.recipients.find((r) => r.mailboxId === mailboxId && r.status === 'sent' && (!recipientEmail || r.email === recipientEmail));
+    if (!mailbox || !r) return original;
+    r.status = 'bounced'; r.bounceReason = 'Simulated hard bounce'; mailbox.bouncesCount++;
+    this.event(state, 'Simulation: Fake Bounce', `${r.email} bounced on ${mailbox.email}.`, 'warn', mailbox);
+    return this.enforceRules(state);
+  }
+
+  injectSimulatedSpamPlacement(mailboxId: string, original: EngineState): EngineState {
+    if (!original.simulationMode) return original;
+    const state = this.clone(original);
+    const mailbox = state.mailboxes.find((m) => m.id === mailboxId && m.status === 'active');
+    if (!mailbox) return original;
+    mailbox.recentSeedPlacements = [...mailbox.recentSeedPlacements, 'spam' as SeedPlacement].slice(-3);
+    this.event(state, 'Simulation: Seed Placement SPAM', `Injected observed SPAM result for ${mailbox.email}.`, 'warn', mailbox);
+    return this.enforceRules(state);
+  }
+
+  injectDelayedSignalEvent(mailboxId: string, original: EngineState): EngineState {
+    if (!original.simulationMode) return original;
+    const state = this.clone(original);
+    const mailbox = state.mailboxes.find((m) => m.id === mailboxId && m.status === 'active');
+    if (!mailbox) return original;
+    if (!state.delayedSignalMailboxes.includes(mailboxId)) state.delayedSignalMailboxes.push(mailboxId);
+    mailbox.backoffActive = true;
+    mailbox.signalCheckAt = this.now() + this.delay(120, state);
+    this.event(state, 'Simulation: Signal Delayed', `Signal delayed for ${mailbox.email}.`, 'warn', mailbox);
+    return this.enforceRules(state);
   }
 }
 

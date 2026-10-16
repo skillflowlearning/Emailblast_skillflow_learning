@@ -6,6 +6,7 @@
 /build/
 /dist/
 /coverage/
+/artifacts/
 *.tsbuildinfo
 
 # Local environment and credentials

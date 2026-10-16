@@ -6,19 +6,22 @@ import { BLAST_CONFIG, canRunLiveSending } from '@/lib/config/blastConfig';
 
 // In-memory global kill switch state on the server
 let isGlobalKillSwitchActive = false;
+const inFlightCampaigns = new Set<string>();
+const revisions = new Map<string, number>();
 
 export async function GET() {
   return NextResponse.json({
     killSwitchActive: isGlobalKillSwitchActive,
     providerMode: BLAST_CONFIG.PROVIDER_MODE,
     canRunLive: canRunLiveSending(),
+    seedEmails: BLAST_CONFIG.LIVE_SEEDS,
   });
 }
 
 /**
  * Server-Side Worker API Route
- * Processes sending batches on the server, enforcing lease locks,
- * idempotency, and the global emergency kill switch.
+ * Executes one due operation per request. Locks and revisions here are
+ * process-local; deployment still needs a durable queue and shared leases.
  */
 export async function POST(req: NextRequest) {
   try {
@@ -30,6 +33,7 @@ export async function POST(req: NextRequest) {
         killSwitchActive: isGlobalKillSwitchActive,
         providerMode: BLAST_CONFIG.PROVIDER_MODE,
         canRunLive: canRunLiveSending(),
+        seedEmails: BLAST_CONFIG.LIVE_SEEDS,
       });
     }
 
@@ -56,35 +60,24 @@ export async function POST(req: NextRequest) {
 
     if (action === 'tick' && engineState && mailboxId) {
       const state = engineState as EngineState;
-
-      // Enforce lease lock on pending recipients before dispatching batch
-      const workerId = `worker-${Date.now()}-${Math.random().toString(36).substring(2, 6)}`;
-      const now = Date.now();
-
-      // Acquire lease on pending recipients for this mailbox to prevent concurrent double-sends
-      const lockedRecipients = state.recipients.map((r) => {
-        if (
-          r.mailboxId === mailboxId &&
-          r.status === 'pending' &&
-          (!r.leaseExpiresAt || r.leaseExpiresAt < now)
-        ) {
-          return {
-            ...r,
-            status: 'sending' as const,
-            leaseExpiresAt: now + BLAST_CONFIG.LEASE_TIMEOUT_MS,
-            leaseWorkerId: workerId,
-          };
-        }
-        return r;
-      });
-
-      // Pass state to blast engine
-      const intermediateState: EngineState = {
-        ...state,
-        recipients: lockedRecipients.map((r) =>
-          r.status === 'sending' ? { ...r, status: 'pending' as const } : r
-        ),
-      };
+      if (!state.campaign?.id || !Array.isArray(state.recipients) || !Array.isArray(state.mailboxes)
+        || !Array.isArray(state.domains) || !Array.isArray(state.delayedSignalMailboxes)
+        || state.recipients.length > BLAST_CONFIG.MAX_RECIPIENTS) {
+        return NextResponse.json({ error: 'Invalid campaign state.' }, { status: 400 });
+      }
+      const expectedRevision = revisions.get(state.campaign.id) || 0;
+      if (inFlightCampaigns.has(state.campaign.id) || (state.revision || 0) !== expectedRevision) {
+        return NextResponse.json({ error: 'Campaign state is stale or another operation is in progress. Sending stopped; reload the current state.' }, { status: 409 });
+      }
+      const live = BLAST_CONFIG.PROVIDER_MODE === 'live';
+      if ((state.campaign.providerMode === 'live') !== live) {
+        return NextResponse.json({ error: 'Campaign mode does not match the server provider mode.' }, { status: 400 });
+      }
+      if (live && (!canRunLiveSending() || !BLAST_CONFIG.LIVE_SEEDS.length)) {
+        return NextResponse.json({ error: 'Live sending requires credentials and configured BLAST_SEED_EMAILS.' }, { status: 400 });
+      }
+      state.simulationMode = !live;
+      inFlightCampaigns.add(state.campaign.id);
 
       // Select appropriate engine based on mode
       const activeEngine =
@@ -96,17 +89,22 @@ export async function POST(req: NextRequest) {
             )
           : blastEngine;
 
-      const result = await activeEngine.processMailboxBatch(mailboxId, intermediateState);
+      try {
+        const result = await activeEngine.processMailboxBatch(mailboxId, state);
+        result.updatedState.revision = expectedRevision + 1;
+        revisions.set(state.campaign.id, result.updatedState.revision);
 
-      // Persist state to Firestore/Storage
-      await blastStorage.saveCampaign(result.updatedState.campaign);
+        await blastStorage.saveCampaign(result.updatedState.campaign);
 
-      return NextResponse.json({
-        success: true,
-        sentThisBatch: result.sentThisBatch,
-        bouncedThisBatch: result.bouncedThisBatch,
-        updatedState: result.updatedState,
-      });
+        return NextResponse.json({
+          success: true,
+          sentThisBatch: result.sentThisBatch,
+          bouncedThisBatch: result.bouncedThisBatch,
+          updatedState: result.updatedState,
+        });
+      } finally {
+        inFlightCampaigns.delete(state.campaign.id);
+      }
     }
 
     return NextResponse.json({ error: 'Invalid worker action or parameters' }, { status: 400 });

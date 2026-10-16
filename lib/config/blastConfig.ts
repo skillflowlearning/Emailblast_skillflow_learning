@@ -36,6 +36,7 @@ export const BLAST_CONFIG = {
   DEFAULT_SENDING_WINDOW: {
     start: '10:00',
     end: '18:00',
+    timeZone: 'Asia/Kolkata',
   },
 
   // Batch Sending Engine
@@ -53,6 +54,7 @@ export const BLAST_CONFIG = {
 
   // Seed List Monitoring
   SEED_INTERVAL: 11, // Every ~11th email goes to a seed address
+  LIVE_SEEDS: (process.env.BLAST_SEED_EMAILS || '').split(',').map((email) => email.trim()).filter(Boolean),
   DEFAULT_SEEDS: [
     'seed.inbox1@inboxprobe.org',
     'seed.inbox2@deliverability-test.io',

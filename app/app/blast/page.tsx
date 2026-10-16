@@ -483,6 +483,10 @@ export default function BlastPage() {
           );
           return;
         }
+        if (statusData.providerMode !== 'live' || !statusData.seedEmails?.length) {
+          setStartError('Live campaigns require BLAST_PROVIDER_MODE=live and BLAST_SEED_EMAILS configured on the server.');
+          return;
+        }
       } catch {
         // Fallback safety refusal if server cannot confirm credentials
         setStartError('Could not verify server credentials for Live Mode. Please check .env.local.');
@@ -515,6 +519,7 @@ export default function BlastPage() {
       sendingWindow: {
         start: windowStart,
         end: windowEnd,
+        timeZone: 'Asia/Kolkata',
       },
       enableRamp,
       rampPercent,

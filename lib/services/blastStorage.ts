@@ -25,6 +25,7 @@ import {
 } from '@/lib/types/blast';
 
 export class BlastStorage {
+  private localSuppression = new Set<string>();
   private isFirebaseConfigured(): boolean {
     const key = process.env.NEXT_PUBLIC_FIREBASE_API_KEY;
     return Boolean(key && key !== 'demo-api-key' && !key.includes('placeholder'));
@@ -116,6 +117,8 @@ export class BlastStorage {
 
   // ── Suppression Check ─────────────────────────────────────────────────
   async isEmailSuppressed(email: string): Promise<boolean> {
+    const normalized = email.toLowerCase().trim();
+    if (this.localSuppression.has(normalized)) return true;
     try {
       if (this.isFirebaseConfigured() && db) {
         const q = query(
@@ -127,13 +130,13 @@ export class BlastStorage {
         return !snap.empty;
       }
     } catch (e) {
-      // In local mode default to false
-      return false;
+      throw new Error('Suppression lookup failed. Sending must wait until it can be checked.');
     }
     return false;
   }
 
   async addSuppression(email: string, reason: string): Promise<void> {
+    this.localSuppression.add(email.toLowerCase().trim());
     try {
       if (this.isFirebaseConfigured() && db) {
         await setDoc(doc(db, 'suppression', email.toLowerCase().trim()), {
@@ -143,7 +146,7 @@ export class BlastStorage {
         });
       }
     } catch (e) {
-      console.warn('[BlastStorage] Firestore addSuppression fallback:', e);
+      throw new Error('Could not persist suppression. Sending must remain paused.');
     }
   }
 }

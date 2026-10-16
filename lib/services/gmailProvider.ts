@@ -21,6 +21,17 @@ import { BLAST_CONFIG, hasLiveGoogleCredentials, hasLiveSmtpCredentials } from '
 // In-memory token cache for Google Service Account impersonation: mailboxEmail -> { token, expiresAt }
 const tokenCache = new Map<string, { token: string; expiresAt: number }>();
 
+interface GmailPart {
+  body?: { data?: string };
+  parts?: GmailPart[];
+}
+
+export function decodeGmailParts(part?: GmailPart): string {
+  if (!part) return '';
+  return [part.body?.data ? Buffer.from(part.body.data, 'base64url').toString('utf8') : '',
+    ...(part.parts || []).map(decodeGmailParts)].filter(Boolean).join('\n');
+}
+
 /**
  * Service Account OAuth2 Assertion Helper
  * Signs a JWT using RSA-SHA256 with the service account private key and exchanges
@@ -137,11 +148,13 @@ export class GmailMailProvider implements MailProvider {
   async sendEmail(params: SendEmailParams): Promise<{ messageId: string; success: boolean }> {
     // 1. Primary: Google Workspace Gmail API via Domain-Wide Delegation
     if (hasLiveGoogleCredentials()) {
+      let dispatchStarted = false;
       try {
         const token = await getGoogleMailboxAccessToken(params.fromEmail);
         const mime = buildMimeMessage(params);
         const rawBase64Url = Buffer.from(mime).toString('base64url');
 
+        dispatchStarted = true;
         const res = await fetch('https://gmail.googleapis.com/gmail/v1/users/me/messages/send', {
           method: 'POST',
           headers: {
@@ -160,7 +173,7 @@ export class GmailMailProvider implements MailProvider {
         return { messageId: data.id, success: true };
       } catch (err) {
         // If SMTP fallback credentials exist, attempt fallback
-        if (hasLiveSmtpCredentials()) {
+        if (!dispatchStarted && hasLiveSmtpCredentials()) {
           console.warn('[GmailMailProvider] Gmail API failed, falling back to SMTP:', err);
           return this.sendViaSmtp(params);
         }
@@ -218,24 +231,24 @@ export class GmailMailProvider implements MailProvider {
 export class GmailBounceSource implements BounceSource {
   async getBounces(mailboxId: string): Promise<BounceEvent[]> {
     if (!hasLiveGoogleCredentials()) {
-      return [];
+      throw new Error('Google credentials are required for bounce checks.');
     }
 
     try {
       const mailboxEmail = mailboxId.includes('@') ? mailboxId : null;
-      if (!mailboxEmail) return [];
+      if (!mailboxEmail) throw new Error('A mailbox email address is required for bounce checks.');
 
       const token = await getGoogleMailboxAccessToken(mailboxEmail);
 
       // Search for Delivery Status Notifications in inbox
-      const query = 'from:(mailer-daemon OR postmaster) "Delivery Status Notification" newer_than:2d';
+      const query = 'in:anywhere from:(mailer-daemon OR postmaster) newer_than:2d';
       const listUrl = `https://gmail.googleapis.com/gmail/v1/users/me/messages?q=${encodeURIComponent(query)}&maxResults=20`;
 
       const listRes = await fetch(listUrl, {
         headers: { Authorization: `Bearer ${token}` },
       });
 
-      if (!listRes.ok) return [];
+      if (!listRes.ok) throw new Error('Bounce lookup failed.');
       const listData = (await listRes.json()) as { messages?: { id: string }[] };
       if (!listData.messages || listData.messages.length === 0) return [];
 
@@ -246,15 +259,15 @@ export class GmailBounceSource implements BounceSource {
           `https://gmail.googleapis.com/gmail/v1/users/me/messages/${msg.id}?format=full`,
           { headers: { Authorization: `Bearer ${token}` } }
         );
-        if (!msgRes.ok) continue;
+        if (!msgRes.ok) throw new Error('Could not read a bounce message.');
 
         const msgData = await msgRes.json();
         const snippet = msgData.snippet || '';
-        const bodyContent = JSON.stringify(msgData);
+        const bodyContent = decodeGmailParts(msgData.payload);
 
         // Parse failed recipient email
         const emailMatch = bodyContent.match(
-          /(?:Final-Recipient|failed-recipient|to:)[^a-zA-Z0-9]*([a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,})/i
+          /(?:Final-Recipient|Original-Recipient):\s*(?:rfc822;)?\s*([a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,})/i
         );
         const bouncedEmail = emailMatch ? emailMatch[1].toLowerCase() : null;
 
@@ -271,6 +284,7 @@ export class GmailBounceSource implements BounceSource {
             timestamp: parseInt(msgData.internalDate, 10) || Date.now(),
             type: isHard ? 'hard' : 'soft',
             statusCode,
+            messageId: msg.id,
             reason: snippet || `DSN Delivery Failure (${statusCode})`,
           });
         }
@@ -278,8 +292,7 @@ export class GmailBounceSource implements BounceSource {
 
       return events;
     } catch (err) {
-      console.warn('[GmailBounceSource] Inbox poll error for', mailboxId, err);
-      return [];
+      throw new Error('Bounce check unavailable. Sending must wait for signals.');
     }
   }
 
@@ -288,7 +301,7 @@ export class GmailBounceSource implements BounceSource {
    * Auto-replies (Auto-Submitted, Out of Office) are filtered out.
    */
   async checkReplies(mailboxEmail: string): Promise<{ email: string; isOptOut: boolean; body: string }[]> {
-    if (!hasLiveGoogleCredentials()) return [];
+    if (!hasLiveGoogleCredentials()) throw new Error('Google credentials are required for reply checks.');
 
     try {
       const token = await getGoogleMailboxAccessToken(mailboxEmail);
@@ -298,7 +311,7 @@ export class GmailBounceSource implements BounceSource {
       const listRes = await fetch(listUrl, {
         headers: { Authorization: `Bearer ${token}` },
       });
-      if (!listRes.ok) return [];
+      if (!listRes.ok) throw new Error('Reply lookup failed.');
       const listData = (await listRes.json()) as { messages?: { id: string }[] };
       if (!listData.messages) return [];
 
@@ -309,7 +322,7 @@ export class GmailBounceSource implements BounceSource {
           `https://gmail.googleapis.com/gmail/v1/users/me/messages/${msg.id}?format=full`,
           { headers: { Authorization: `Bearer ${token}` } }
         );
-        if (!msgRes.ok) continue;
+        if (!msgRes.ok) throw new Error('Could not read a reply.');
 
         const msgData = await msgRes.json();
         const headers = (msgData.payload?.headers || []) as { name: string; value: string }[];
@@ -317,10 +330,13 @@ export class GmailBounceSource implements BounceSource {
         const autoSubmitted = headers.find((h) => h.name.toLowerCase() === 'auto-submitted')?.value;
         const subject = headers.find((h) => h.name.toLowerCase() === 'subject')?.value || '';
         const fromHeader = headers.find((h) => h.name.toLowerCase() === 'from')?.value || '';
+        const inReplyTo = headers.find((h) => h.name.toLowerCase() === 'in-reply-to')?.value;
+        const references = headers.find((h) => h.name.toLowerCase() === 'references')?.value;
+        if (!inReplyTo && !references) continue;
 
         // Filter out auto-replies (out of office / auto-submitted)
         if (
-          autoSubmitted === 'auto-replied' ||
+          (autoSubmitted && autoSubmitted.toLowerCase() !== 'no') ||
           /out of office|auto-reply|automatic reply|vacation/i.test(subject)
         ) {
           continue; // Auto-replies must not count as human replies
@@ -330,8 +346,8 @@ export class GmailBounceSource implements BounceSource {
         const senderEmail = emailMatch ? emailMatch[1].toLowerCase() : null;
         if (!senderEmail) continue;
 
-        const snippet = msgData.snippet || '';
-        const isOptOut = /stop|unsubscribe|remove me|opt-out|optout/i.test(snippet);
+        const snippet = decodeGmailParts(msgData.payload) || msgData.snippet || '';
+        const isOptOut = /\b(stop|unsubscribe|remove me|opt-out|optout)\b/i.test(snippet);
 
         replies.push({
           email: senderEmail,
@@ -342,8 +358,7 @@ export class GmailBounceSource implements BounceSource {
 
       return replies;
     } catch (err) {
-      console.warn('[GmailBounceSource] Check replies error:', err);
-      return [];
+      throw new Error('Reply check unavailable. Sending must wait for signals.');
     }
   }
 }
@@ -358,14 +373,16 @@ export class GmailSeedChecker implements SeedChecker {
   async checkSeedPlacement(
     seedEmail: string,
     campaignId: string,
-    mailboxId: string
+    mailboxId: string,
+    seedToken?: string,
   ): Promise<SeedCheckResult> {
     if (hasLiveGoogleCredentials()) {
       try {
         const token = await getGoogleMailboxAccessToken(seedEmail);
 
         // Search for message received by seed inbox
-        const q = `to:${seedEmail} newer_than:1d`;
+        if (!seedToken) throw new Error('A seed token is required to match this probe.');
+        const q = `in:anywhere to:${seedEmail} from:${mailboxId} "${seedToken}" newer_than:2d`;
         const listRes = await fetch(
           `https://gmail.googleapis.com/gmail/v1/users/me/messages?q=${encodeURIComponent(q)}&maxResults=5`,
           { headers: { Authorization: `Bearer ${token}` } }
@@ -407,6 +424,7 @@ export class GmailSeedChecker implements SeedChecker {
                 };
               }
 
+              if (!labelIds.includes('INBOX')) throw new Error('Seed message has no supported placement label.');
               return {
                 seedEmail,
                 placement: 'inbox',
@@ -423,15 +441,7 @@ export class GmailSeedChecker implements SeedChecker {
       }
     }
 
-    // Default seed simulation fallback
-    return {
-      seedEmail,
-      placement: 'inbox',
-      timestamp: Date.now(),
-      mailboxId,
-      campaignId,
-      folderFound: 'INBOX',
-    };
+    throw new Error('Seed placement is unavailable. Do not assume inbox delivery.');
   }
 
   /**

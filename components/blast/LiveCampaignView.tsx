@@ -34,7 +34,7 @@ import {
   DomainStatus,
 } from '@/lib/types/blast';
 import { BLAST_CONFIG } from '@/lib/config/blastConfig';
-import { blastEngine, EngineState } from '@/lib/services/blastEngine';
+import { blastEngine, EngineState, sendingDate } from '@/lib/services/blastEngine';
 
 interface LiveCampaignViewProps {
   initialCampaign: Campaign;
@@ -68,9 +68,9 @@ export default function LiveCampaignView({
       },
     ],
     seedIndex: 0,
-    simulationMode: true,
-    simulationSpeedMultiplier: 1,
-    delayedSignalMailboxes: new Set<string>(),
+    simulationMode: initialCampaign.providerMode !== 'live',
+    simulationSpeedMultiplier: 60,
+    delayedSignalMailboxes: [],
   }));
 
   // Auto-Simulation running state
@@ -79,6 +79,8 @@ export default function LiveCampaignView({
   const [eventFilter, setEventFilter] = useState<'all' | 'issues' | 'seeds'>('all');
   const [killSwitchActive, setKillSwitchActive] = useState(false);
   const isTickingRef = useRef(false);
+  const [isTicking, setIsTicking] = useState(false);
+  const [liveSeeds, setLiveSeeds] = useState<string[]>([]);
 
   const { campaign, recipients, domains, mailboxes, events } = engineState;
 
@@ -92,6 +94,7 @@ export default function LiveCampaignView({
       .then((r) => r.json())
       .then((d) => {
         if (d.killSwitchActive) setKillSwitchActive(true);
+        if (Array.isArray(d.seedEmails)) setLiveSeeds(d.seedEmails);
       })
       .catch(() => {});
   }, []);
@@ -149,29 +152,32 @@ export default function LiveCampaignView({
 
   // ── Auto-Tick Loop (Simulates parallel batches via server worker) ──────────
   useEffect(() => {
-    if (!isSimulating || campaign.status !== 'running' || killSwitchActive) return;
+    if (!isSimulating || !['running', 'alert_paused'].includes(campaign.status) || killSwitchActive) return;
 
     const interval = setInterval(async () => {
       if (isTickingRef.current) return;
       isTickingRef.current = true;
+      setIsTicking(true);
 
       try {
         // Pick an active mailbox that still has pending recipients and cap
         const activeMailboxes = engineState.mailboxes.filter(
           (m) =>
             m.status === 'active' &&
-            m.dailyCap - m.sentToday > 0 &&
-            engineState.recipients.some((r) => r.mailboxId === m.id && r.status === 'pending')
+            (Boolean(m.signalCheckAt) || (campaign.status === 'running' &&
+              ((m.dailyResetDate && m.dailyResetDate !== sendingDate(campaign, Date.now())) ||
+              (m.dailyCap - m.sentToday > 0 && engineState.recipients.some((r) => r.mailboxId === m.id && r.status === 'pending')))))
         );
 
         if (activeMailboxes.length > 0) {
           // Process one active mailbox per tick to simulate realistic parallel staggered batches
-          const randomActive =
-            activeMailboxes[Math.floor(Math.random() * activeMailboxes.length)];
+          const randomActive = activeMailboxes.sort((a, b) =>
+            (a.signalCheckAt || a.nextSendAt || 0) - (b.signalCheckAt || b.nextSendAt || 0))[0];
 
-          // Attempt server-side worker execution with lease locks & idempotency
-          let batchHandled = false;
-          try {
+          let updatedState: EngineState;
+          if (engineState.simulationMode) {
+            updatedState = (await blastEngine.processMailboxBatch(randomActive.id, engineState)).updatedState;
+          } else {
             const workerRes = await fetch('/api/blast/worker', {
               method: 'POST',
               headers: { 'Content-Type': 'application/json' },
@@ -182,33 +188,24 @@ export default function LiveCampaignView({
               }),
             });
 
-            if (workerRes.ok) {
-              const workerData = await workerRes.json();
-              if (workerData.updatedState) {
-                setEngineState(workerData.updatedState);
-                batchHandled = true;
-              }
-            } else {
+            if (!workerRes.ok) {
               const errData = await workerRes.json().catch(() => null);
               if (errData?.killed) {
                 setKillSwitchActive(true);
-                return;
               }
+              throw new Error(errData?.error || 'Worker request failed. Sending paused.');
             }
-          } catch {
-            // Worker endpoint unreachable or local offline mode
+            const workerData = await workerRes.json();
+            if (!workerData.updatedState) throw new Error('Worker returned no campaign state.');
+            updatedState = workerData.updatedState;
           }
-
-          if (!batchHandled) {
-            const result = await blastEngine.processMailboxBatch(
-              randomActive.id,
-              engineState
-            );
-            setEngineState(result.updatedState);
-          }
+          setEngineState((prev) => ({ ...updatedState,
+            campaign: prev.campaign.status === 'running' ? updatedState.campaign
+              : { ...updatedState.campaign, status: prev.campaign.status },
+          }));
         } else {
           // Check if all pending are done
-          const pendingRemaining = engineState.recipients.some((r) => r.status === 'pending');
+          const pendingRemaining = engineState.recipients.some((r) => r.status === 'pending' || r.status === 'sending');
           if (!pendingRemaining && campaign.status === 'running') {
             setEngineState((prev) => ({
               ...prev,
@@ -233,8 +230,11 @@ export default function LiveCampaignView({
         }
       } catch (err) {
         console.error('[LiveCampaignView] Tick execution error:', err);
+        setEngineState((prev) => ({ ...prev, campaign: { ...prev.campaign, status: 'alert_paused',
+          rootCauseHint: err instanceof Error ? err.message : 'Worker unavailable. Sending paused.' } }));
       } finally {
         isTickingRef.current = false;
+        setIsTicking(false);
       }
     }, 2000); // 2-second simulation tick interval
 
@@ -243,7 +243,10 @@ export default function LiveCampaignView({
 
   // ── Manual Step Batch (Run 1 Batch on all active mailboxes) ─────────────
   const handleStepBatch = async () => {
-    if (campaign.status !== 'running' && campaign.status !== 'paused') return;
+    if (!engineState.simulationMode || campaign.status !== 'running' || killSwitchActive || isTickingRef.current) return;
+    isTickingRef.current = true;
+    setIsTicking(true);
+    try {
     let currentState = engineState;
 
     const activeMailboxes = currentState.mailboxes.filter(
@@ -256,6 +259,7 @@ export default function LiveCampaignView({
     }
 
     setEngineState(currentState);
+    } finally { isTickingRef.current = false; setIsTicking(false); }
   };
 
   // ── Manual Campaign Pause / Resume ───────────────────────────────────────
@@ -283,9 +287,10 @@ export default function LiveCampaignView({
     setEngineState((prev) => {
       const target = prev.mailboxes.find((m) => m.id === mailboxId);
       if (!target) return prev;
+      if (target.status !== 'active') return blastEngine.resumeMailbox(mailboxId, prev);
 
       const newStatus: MailboxStatus = target.status === 'active' ? 'paused' : 'active';
-      const updatedMailboxes = prev.mailboxes.map((m) =>
+      let updatedMailboxes = prev.mailboxes.map((m) =>
         m.id === mailboxId ? { ...m, status: newStatus } : m
       );
 
@@ -310,10 +315,12 @@ export default function LiveCampaignView({
           updatedRecipients,
           updatedMailboxes,
           updatedEvents,
-          prev.campaign.id
+          prev.campaign.id,
+          prev.domains,
         );
         updatedRecipients = realloc.updatedRecipients;
         updatedEvents = realloc.updatedEvents;
+        updatedMailboxes = realloc.updatedMailboxes;
       }
 
       return {
@@ -331,13 +338,14 @@ export default function LiveCampaignView({
       const target = prev.domains.find((d) => d.id === domainId);
       if (!target) return prev;
 
-      const newStatus: DomainStatus = target.status === 'active' ? 'paused' : 'active';
+      if (target.status === 'paused' && prev.mailboxes.some((m) => m.domainId === domainId && (m.cooldownUntil || 0) > Date.now())) return prev;
+      const newStatus: DomainStatus = target.status === 'paused' ? 'active' : 'paused';
       const updatedDomains = prev.domains.map((d) =>
         d.id === domainId ? { ...d, status: newStatus } : d
       );
 
       // If domain paused, pause its mailboxes too
-      const updatedMailboxes = prev.mailboxes.map((m) => {
+      let updatedMailboxes = prev.mailboxes.map((m) => {
         if (m.domainId === domainId && newStatus === 'paused') {
           return { ...m, status: 'paused' as const };
         }
@@ -363,10 +371,12 @@ export default function LiveCampaignView({
           updatedRecipients,
           updatedMailboxes,
           updatedEvents,
-          prev.campaign.id
+          prev.campaign.id,
+          updatedDomains,
         );
         updatedRecipients = realloc.updatedRecipients;
         updatedEvents = realloc.updatedEvents;
+        updatedMailboxes = realloc.updatedMailboxes;
       }
 
       return {
@@ -408,7 +418,7 @@ export default function LiveCampaignView({
   const totalRecipients = recipients.length;
   const sentCount = recipients.filter((r) => r.status === 'sent').length;
   const bouncedCount = recipients.filter((r) => r.status === 'bounced').length;
-  const pendingCount = recipients.filter((r) => r.status === 'pending').length;
+  const pendingCount = recipients.filter((r) => r.status === 'pending' || r.status === 'sending').length;
   const skippedCount = recipients.filter((r) => r.status === 'skipped').length;
 
   const progressPercent = totalRecipients > 0 ? Math.round((sentCount / totalRecipients) * 100) : 0;
@@ -505,7 +515,7 @@ export default function LiveCampaignView({
                 EMERGENCY GLOBAL KILL SWITCH ENGAGED
               </h3>
               <p className="text-xs text-red-100 leading-relaxed">
-                All sending is instantly suspended across the entire mailbox fleet and server workers. Lease locks are frozen and no emails will leave any mailbox.
+                Further sending is suspended. A message already handed to the mail provider may still be delivered.
               </p>
             </div>
           </div>
@@ -544,14 +554,14 @@ export default function LiveCampaignView({
       )}
 
       {/* ── Simulation Control Panel ───────────────────────────────────────── */}
-      <Card className="rounded-3xl border-dashed border-2 border-indigo-200 dark:border-indigo-900/50 bg-indigo-50/30 dark:bg-indigo-950/10">
+      {engineState.simulationMode && <Card className="rounded-3xl border-dashed border-2 border-indigo-200 dark:border-indigo-900/50 bg-indigo-50/30 dark:bg-indigo-950/10">
         <CardHeader className="pb-3">
           <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2">
             <CardTitle className="text-sm font-semibold flex items-center gap-2 text-indigo-900 dark:text-indigo-200">
               <Bug className="w-4 h-4 text-indigo-500" />
               Simulation Testing Sandbox
               <Badge variant="outline" className="text-xs text-indigo-600 border-indigo-300">
-                Mock Providers Active
+                No real email • 60× clock
               </Badge>
             </CardTitle>
             <div className="flex items-center gap-2">
@@ -575,10 +585,11 @@ export default function LiveCampaignView({
                 size="sm"
                 variant="outline"
                 onClick={handleStepBatch}
+                disabled={isTicking || killSwitchActive || campaign.status !== 'running'}
                 className="h-8 text-xs rounded-xl font-medium"
                 title="Send one batch tick immediately"
               >
-                <FastForward className="w-3 h-3 mr-1 text-indigo-500" /> Step Next Batch
+                <FastForward className="w-3 h-3 mr-1 text-indigo-500" /> Step Next Tick
               </Button>
             </div>
           </div>
@@ -608,6 +619,7 @@ export default function LiveCampaignView({
               size="sm"
               variant="outline"
               onClick={handleInjectBounce}
+              disabled={isTicking || killSwitchActive}
               className="h-8 text-xs rounded-xl hover:bg-red-50 hover:text-red-700 dark:hover:bg-red-950/40"
             >
               + Inject Fake Bounce
@@ -616,6 +628,7 @@ export default function LiveCampaignView({
               size="sm"
               variant="outline"
               onClick={handleInjectSpam}
+              disabled={isTicking || killSwitchActive}
               className="h-8 text-xs rounded-xl hover:bg-amber-50 hover:text-amber-700 dark:hover:bg-amber-950/40"
             >
               + Inject Seed Spam
@@ -624,13 +637,14 @@ export default function LiveCampaignView({
               size="sm"
               variant="outline"
               onClick={handleInjectDelay}
+              disabled={isTicking || killSwitchActive}
               className="h-8 text-xs rounded-xl hover:bg-blue-50 hover:text-blue-700 dark:hover:bg-blue-950/40"
             >
               + Inject Delayed Signal
             </Button>
           </div>
         </CardContent>
-      </Card>
+      </Card>}
 
       {/* ── Key Metrics Cards ──────────────────────────────────────────────── */}
       <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4">
@@ -782,6 +796,7 @@ export default function LiveCampaignView({
                     size="sm"
                     variant="ghost"
                     onClick={() => toggleDomainStatus(domain.id)}
+                    disabled={isTicking || (isDomainPaused && domainMailboxes.some((m) => (m.cooldownUntil || 0) > Date.now()))}
                     className="text-xs h-8 rounded-xl self-start sm:self-auto"
                   >
                     {isDomainPaused ? (
@@ -854,6 +869,7 @@ export default function LiveCampaignView({
                         </div>
 
                         {/* Health & Seed Placements */}
+                        <p className="text-[11px] text-gray-500">{mbx.assignedRecipientCount} recipients pending</p>
                         <div className="flex items-center justify-between text-[11px] pt-1 border-t border-gray-100 dark:border-gray-700/50">
                           <span
                             className={hasHighBounce ? 'text-red-500 font-bold' : 'text-gray-500'}
@@ -886,7 +902,7 @@ export default function LiveCampaignView({
                         {isMbxCooldown && (
                           <div className="text-[10px] text-red-600 dark:text-red-400 flex items-center gap-1 font-medium">
                             <AlertTriangle className="w-3 h-3 shrink-0" />
-                            Cooldown active (48h) &bull; Auto-reallocated
+                            {mbx.cooldownUntil ? `Cooldown until ${new Date(mbx.cooldownUntil).toLocaleString()}` : 'Mailbox paused'}
                           </div>
                         )}
 
@@ -903,9 +919,10 @@ export default function LiveCampaignView({
                             size="sm"
                             variant="outline"
                             onClick={() => toggleMailboxStatus(mbx.id)}
+                            disabled={isTicking || (!isMbxActive && (isDomainPaused || (mbx.cooldownUntil || 0) > Date.now()))}
                             className="w-full h-6 text-[10px] rounded-lg"
                           >
-                            {isMbxActive ? 'Pause Mailbox' : 'Resume Mailbox'}
+                            {isMbxActive ? 'Pause Mailbox' : mbx.status === 'spare' ? 'Activate Spare' : 'Resume Mailbox'}
                           </Button>
                         </div>
                       </div>
@@ -928,7 +945,7 @@ export default function LiveCampaignView({
                 Seed Inboxes &amp; Placement Probing
               </CardTitle>
               <CardDescription className="text-xs">
-                Connected test inboxes queried via Gmail API. Every ~11th email probes a seed to classify inbox vs promotions vs spam.
+                {engineState.simulationMode ? 'Demo seed inboxes for simulation. No real email is sent.' : 'Configured seed inboxes checked via Gmail API. Every 11th outgoing message is a seed probe.'}
               </CardDescription>
             </div>
             <Badge variant="outline" className="text-xs text-blue-600 dark:text-blue-400 border-blue-200 dark:border-blue-800 self-start sm:self-auto">
@@ -938,7 +955,7 @@ export default function LiveCampaignView({
         </CardHeader>
         <CardContent className="space-y-4">
           <div className="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-3 lg:grid-cols-4 gap-3">
-            {BLAST_CONFIG.DEFAULT_SEEDS.map((seedEmail, idx) => {
+            {(engineState.simulationMode ? BLAST_CONFIG.DEFAULT_SEEDS : liveSeeds).map((seedEmail, idx) => {
               // Find latest placement event for this seed if any
               const seedEvt = events.find((e) => e.title.includes('Seed') && e.description.includes(seedEmail));
               const isSpam = seedEvt?.description.toLowerCase().includes('spam');
@@ -954,12 +971,12 @@ export default function LiveCampaignView({
                     <span className="text-[11px] font-mono font-medium text-gray-900 dark:text-gray-100 truncate">
                       {seedEmail}
                     </span>
-                    <span className="w-2 h-2 rounded-full bg-green-500 shrink-0" title="Connected via Gmail API" />
+                    <span className="w-2 h-2 rounded-full bg-gray-400 shrink-0" title={engineState.simulationMode ? 'Simulated inbox' : 'Configured inbox; connection checked on probe'} />
                   </div>
 
                   <div className="flex items-center justify-between text-[11px]">
                     <span className="text-gray-400">Platform:</span>
-                    <span className="text-gray-600 dark:text-gray-300 font-medium">Google Workspace</span>
+                    <span className="text-gray-600 dark:text-gray-300 font-medium">{engineState.simulationMode ? 'Simulation' : 'Google Workspace'}</span>
                   </div>
 
                   <div className="flex items-center justify-between text-[11px] pt-1 border-t border-gray-200/50 dark:border-gray-700/50">
