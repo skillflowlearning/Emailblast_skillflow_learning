@@ -1,6 +1,6 @@
 // Server entry point. Import only from API routes/tests, never from client components.
 import nodemailer from 'nodemailer';
-import { createHash, randomUUID, timingSafeEqual } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import type { WorkspaceStore } from '../server/model';
 import { seal } from '../server/secrets';
 import { TEST_RULES, personalizeTest, testDate, testFooter, validTestEmail, type TestRecipient, type TestResult } from './config';
@@ -9,10 +9,8 @@ if (typeof window !== 'undefined') throw new Error('Temporary SMTP transport is 
 export class TestRequestError extends Error {
   constructor(message: string, public status = 400) { super(message); }
 }
-export function authorizeTemporaryTest(passcode: unknown) {
+export function authorizeTemporaryTest() {
   if (process.env.TEST_MODE_ENABLED !== 'true') throw new TestRequestError('Temporary test mode is disabled.', 403);
-  const expected = process.env.TEST_SEND_PASSCODE;
-  if (!expected || typeof passcode !== 'string' || passcode.length > 512 || !timingSafeEqual(createHash('sha256').update(passcode).digest(), createHash('sha256').update(expected).digest())) throw new TestRequestError('Invalid test passcode.', 403);
 }
 export function temporarySenderKey() {
   return createHash('sha256').update(`${process.env.SMTP_HOST || ''}:${process.env.TEST_FROM_EMAIL || process.env.SMTP_USER || 'unconfigured'}`).digest('hex').slice(0, 24);

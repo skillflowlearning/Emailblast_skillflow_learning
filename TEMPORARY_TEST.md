@@ -6,7 +6,6 @@ Add these **server-only** variables in Vercel and redeploy:
 
 ```env
 TEST_MODE_ENABLED=true
-TEST_SEND_PASSCODE=
 SMTP_HOST=
 SMTP_PORT=587
 SMTP_SECURE=false
@@ -22,12 +21,12 @@ Existing Firebase authentication/Firestore, stable `BLAST_APP_SECRET`, and canon
 
 Set the Vercel function duration to support 120 seconds. Ten sequential sends plus 3–8 second gaps can exceed a short function timeout. The handler stops starting new sends after its 90-second processing budget; SMTP timeouts are bounded. A platform timeout can still leave an uncertain result. Never automatically retry that batch.
 
-Enter only owned addresses, subject/body, your real physical business address and passcode. `{{name}}` uses the recipient address prefix. Preview shows placeholders for the server-only sender and signed link; actual mail includes those values and List-Unsubscribe headers.
+Enter only owned addresses, subject/body and your real physical business address. `{{name}}` uses the recipient address prefix. Preview shows placeholders for the server-only sender and signed link; actual mail includes those values and List-Unsubscribe headers.
 
-Dry run is on by default and sends nothing. It still validates the passcode, respects suppression/kill switch and exercises the same delays with a separate test quota. The yellow banner remains visible.
+Dry run is on by default and sends nothing. It respects suppression/kill switch and exercises the same delays with a separate test quota. The yellow banner remains visible.
 
 Browser localStorage tracks date/sender quota in Asia/Kolkata; a server-side transactional sender ledger also enforces 50/day across tabs/accounts. Failed/uncertain attempts conservatively consume capacity. Requests contain at most 10 unique recipients. Pending overflow is saved locally with a downloadable CSV; load it manually tomorrow. No automatic retries or page-reload sending occurs.
 
 Pause freezes the inter-batch countdown; Stop prevents subsequent requests. An already-submitted server batch may finish. Browser Web Locks prevents concurrent runs for a sender in compatible browsers; the server also serializes batches. Clearing browser data does not reset the server cap. Use the existing emergency kill switch to block further sends inside a running batch.
 
-Turn `TEST_MODE_ENABLED=false` and redeploy when finished. Keep passcodes out of screenshots and shared screen recordings.
+Turn `TEST_MODE_ENABLED=false` and redeploy when finished.

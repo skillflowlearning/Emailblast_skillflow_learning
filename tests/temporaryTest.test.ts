@@ -12,14 +12,14 @@ class MemoryStore implements WorkspaceStore {
 }
 const draft = (count = 1, dryRun = true) => ({ recipients: Array.from({ length: count }, (_, i) => ({ email: `owned${i}@example.com`, name: `Owner${i}` })), subject: 'Hi {{name}}', body: 'Hello {{name}}', businessAddress: '123 Test Street', batchId: 'fixture-batch-123', dryRun });
 async function withConfig(run: () => Promise<void>) {
-  const config = { TEST_MODE_ENABLED: 'true', TEST_SEND_PASSCODE: 'fixture-only-passcode', SMTP_HOST: 'smtp.example.invalid', SMTP_PORT: '587', SMTP_SECURE: 'false', SMTP_USER: 'sender@example.com', SMTP_PASS: 'fixture-only-password', TEST_FROM_NAME: 'Test Sender', TEST_FROM_EMAIL: 'sender@example.com', NEXT_PUBLIC_APP_URL: 'http://localhost:3000', BLAST_APP_SECRET: 'fixture-only-app-secret-at-least-32-characters' };
+  const config = { TEST_MODE_ENABLED: 'true', SMTP_HOST: 'smtp.example.invalid', SMTP_PORT: '587', SMTP_SECURE: 'false', SMTP_USER: 'sender@example.com', SMTP_PASS: 'fixture-only-password', TEST_FROM_NAME: 'Test Sender', TEST_FROM_EMAIL: 'sender@example.com', NEXT_PUBLIC_APP_URL: 'http://localhost:3000', BLAST_APP_SECRET: 'fixture-only-app-secret-at-least-32-characters' };
   const previous = Object.fromEntries(Object.keys(config).map((key) => [key, process.env[key]]));
   Object.assign(process.env, config);
   try { await run(); } finally { for (const key of Object.keys(config)) { if (previous[key] === undefined) delete process.env[key]; else process.env[key] = previous[key]; } }
 }
-test('temporary test requires enabled mode and correct passcode on every request', async () => withConfig(async () => {
-  authorizeTemporaryTest('fixture-only-passcode'); assert.throws(() => authorizeTemporaryTest('wrong'));
-  process.env.TEST_MODE_ENABLED = 'false'; assert.throws(() => authorizeTemporaryTest('fixture-only-passcode'));
+test('temporary test requires enabled mode', async () => withConfig(async () => {
+  authorizeTemporaryTest();
+  process.env.TEST_MODE_ENABLED = 'false'; assert.throws(() => authorizeTemporaryTest());
 }));
 test('temporary test parses separators, removes duplicates and rejects invalid syntax/oversized batches', () => {
   const parsed = parseTestRecipients('Me@example.com, me@example.com\nsecond@example.com third@example.com invalid');

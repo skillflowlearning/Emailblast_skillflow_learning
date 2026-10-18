@@ -10,7 +10,7 @@ function counterKey(sender: string, dry: boolean) { return `${TEST_RULES.storage
 function readUsed(key: string) { const value = Number(localStorage.getItem(key) || 0); if (!Number.isInteger(value) || value < 0) throw new Error('Invalid saved counter. Check browser storage before sending.'); return Math.min(TEST_RULES.dailyCap, value); }
 export default function TemporaryTestPage() {
   const [raw, setRaw] = useState(''); const [subject, setSubject] = useState('Hello {{name}}'); const [body, setBody] = useState('Hi {{name}},\n\nThis is my own-address email test.');
-  const [address, setAddress] = useState(''); const [passcode, setPasscode] = useState(''); const [dry, setDry] = useState(true); const [owned, setOwned] = useState(false);
+  const [address, setAddress] = useState(''); const [dry, setDry] = useState(true); const [owned, setOwned] = useState(false);
   const [pauseSeconds, setPauseSeconds] = useState<number>(TEST_RULES.defaultPauseSeconds); const [countdown, setCountdown] = useState(0);
   const [results, setResults] = useState<TestResult[]>([]); const [phase, setPhase] = useState<Phase>('idle'); const [busy, setBusy] = useState(false);
   const [remaining, setRemaining] = useState<number>(); const [error, setError] = useState(''); const [notice, setNotice] = useState('');
@@ -29,13 +29,13 @@ export default function TemporaryTestPage() {
   const restore = () => { try { const saved = JSON.parse(localStorage.getItem(pendingKey) || '[]') as TestResult[]; setRaw(saved.map((r) => r.email).join('\n')); setNotice(`Loaded ${saved.length} pending addresses. Review ownership before starting a new run.`); } catch { setError('Could not read pending browser data.'); } };
   const start = async () => {
     if (running.current) return; setError(''); setNotice('');
-    if (!owned || !passcode || !subject.trim() || !body.trim() || !address.trim()) { setError('Confirm address ownership and fill the passcode, subject, message and business address.'); return; }
+    if (!owned || !subject.trim() || !body.trim() || !address.trim()) { setError('Confirm address ownership and fill the subject, message and business address.'); return; }
     if (!parsed.recipients.length || parsed.recipients.length > TEST_RULES.maxRecipients || parsed.invalid.length) { setError('Enter 1–60 valid unique addresses. Correct the invalid entries first.'); return; }
     if (!Number.isInteger(pauseSeconds) || pauseSeconds < 0 || pauseSeconds > TEST_RULES.maxPauseSeconds) { setError('Batch pause must be 0–3600 whole seconds.'); return; }
     running.current = true; setBusy(true); setResults([]); control.current = { paused: false, stop: false };
     let all: TestResult[] = []; let queue: TestRecipient[] = [...parsed.recipients];
     try {
-      const { senderKey } = await api<{ senderKey: string }>('/api/temporary-test', { action: 'prepare', passcode });
+      const { senderKey } = await api<{ senderKey: string }>('/api/temporary-test', { action: 'prepare' });
       const run = async () => {
         const key = () => counterKey(senderKey, dry);
         let available = Math.max(0, TEST_RULES.dailyCap - readUsed(key())); setRemaining(available);
@@ -51,7 +51,7 @@ export default function TemporaryTestPage() {
           localStorage.setItem(batchKey, String(readUsed(batchKey) + batch.length)); setRemaining(TEST_RULES.dailyCap - readUsed(batchKey));
           setPhase('sending');
           try {
-            const response = await api<{ results: TestResult[]; remainingToday: number }>('/api/temporary-test', { passcode, recipients: batch, subject, body, businessAddress: address, dryRun: dry, batchId: crypto.randomUUID() });
+            const response = await api<{ results: TestResult[]; remainingToday: number }>('/api/temporary-test', { recipients: batch, subject, body, businessAddress: address, dryRun: dry, batchId: crypto.randomUUID() });
             all.push(...response.results);
             const unused = response.results.filter((r) => !r.attempted).length;
             localStorage.setItem(batchKey, String(Math.max(0, readUsed(batchKey) - unused)));
@@ -93,7 +93,6 @@ export default function TemporaryTestPage() {
         <label className="block">Subject<Input disabled={busy} value={subject} onChange={(e) => setSubject(e.target.value)} maxLength={200} /></label>
         <label className="block">Plain-text message<textarea aria-label="Test message" disabled={busy} className="test-input min-h-48" value={body} onChange={(e) => setBody(e.target.value)} maxLength={50000} /></label>
         <label className="block">Physical business address<Input disabled={busy} value={address} onChange={(e) => setAddress(e.target.value)} maxLength={500} /></label>
-        <label className="block">Test passcode<Input type="password" autoComplete="off" disabled={busy} value={passcode} onChange={(e) => setPasscode(e.target.value)} /></label>
         <label className="block">Pause between batches (seconds)<Input type="number" min={0} max={3600} disabled={busy} value={pauseSeconds} onChange={(e) => setPauseSeconds(Number(e.target.value))} /></label>
         <label className="flex items-center gap-3 min-h-11"><input type="checkbox" checked={dry} disabled={busy} onChange={(e) => { setDry(e.target.checked); setRemaining(undefined); }} />Dry run — simulate without sending</label>
         <label className="flex items-start gap-3 min-h-11"><input type="checkbox" checked={owned} disabled={busy} onChange={(e) => setOwned(e.target.checked)} /><span>I own every recipient address in this test.</span></label>
