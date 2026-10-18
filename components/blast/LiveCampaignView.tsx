@@ -496,7 +496,7 @@ export default function LiveCampaignView({
           </p>
         </div>
 
-        <div className="flex items-center gap-2 flex-wrap">
+        <div className="mobile-live-actions flex items-center gap-2 flex-wrap">
           <Button
             variant={killSwitchActive ? 'destructive' : 'outline'}
             onClick={handleToggleKillSwitch}

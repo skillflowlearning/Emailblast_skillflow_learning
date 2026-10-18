@@ -1,6 +1,9 @@
 'use client';
 import Link from 'next/link';
 import { usePathname } from 'next/navigation';
+import { useState } from 'react';
+import * as Dialog from '@radix-ui/react-dialog';
+import { Menu, X } from 'lucide-react';
 import {
   LayoutGrid,
   Send,
@@ -16,6 +19,7 @@ import AccountPanel from './AccountPanel';
 const navItems = [
   { label: 'Services', href: '/services', icon: LayoutGrid },
   { label: 'Campaigns', href: '/campaigns', icon: Send },
+  { label: 'Temporary test', href: '/app/blast/test', icon: Send },
   { label: 'Domains', href: '/domains', icon: Globe },
   { label: 'Reports', href: '/reports', icon: BarChart3 },
   { label: 'Settings', href: '/settings', icon: Settings },
@@ -23,7 +27,8 @@ const navItems = [
 
 export default function Sidebar() {
   const pathname = usePathname();
-  return (
+  const [open, setOpen] = useState(false);
+  const navigation = (
     <aside className="w-64 min-h-screen bg-white dark:bg-gray-900 border-r border-gray-100 dark:border-gray-800 flex flex-col">
       <div className="p-6 border-b border-gray-100 dark:border-gray-800">
         <Link href="/" className="flex items-center gap-2">
@@ -41,6 +46,7 @@ export default function Sidebar() {
             <Link
               key={item.href}
               href={item.href}
+              onClick={() => setOpen(false)}
               className={cn(
                 'flex items-center gap-3 px-3 py-2.5 rounded-xl text-sm font-medium transition-colors',
                 active
@@ -67,4 +73,18 @@ export default function Sidebar() {
       </div>
     </aside>
   );
+  return <>
+    <div className="hidden lg:block shrink-0">{navigation}</div>
+    <header className="mobile-header lg:hidden sticky top-0 z-40 flex items-center justify-between border-b bg-white dark:bg-gray-900 dark:border-gray-800 px-4 py-2">
+      <Link href="/services" className="font-bold min-h-11 flex items-center">MailFlow</Link>
+      <Dialog.Root open={open} onOpenChange={setOpen}>
+        <Dialog.Trigger className="min-h-11 min-w-11 flex items-center justify-center rounded-lg border" aria-label="Open navigation"><Menu /></Dialog.Trigger>
+        <Dialog.Portal><Dialog.Overlay className="fixed inset-0 z-50 bg-black/50" /><Dialog.Content className="mobile-sidebar fixed inset-y-0 left-0 z-[60] w-[min(320px,90vw)] overflow-y-auto bg-white dark:bg-gray-900">
+          <Dialog.Title className="sr-only">Navigation</Dialog.Title><Dialog.Description className="sr-only">Choose an app page or manage your account.</Dialog.Description>
+          <Dialog.Close className="absolute right-3 top-4 min-h-11 min-w-11 flex items-center justify-center rounded-lg" aria-label="Close navigation"><X /></Dialog.Close>
+          {navigation}
+        </Dialog.Content></Dialog.Portal>
+      </Dialog.Root>
+    </header>
+  </>;
 }

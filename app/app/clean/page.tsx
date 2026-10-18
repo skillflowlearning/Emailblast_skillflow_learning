@@ -140,7 +140,7 @@ export default function CleanPage() {
             />
             {error && <p className="text-red-500 text-sm mt-3">{error}</p>}
             {emails.length > 0 && (
-              <Button className="w-full mt-4" onClick={startVerification}>
+              <Button className="mobile-action-button w-full mt-4" onClick={startVerification}>
                 Verify {emails.length} Emails
               </Button>
             )}

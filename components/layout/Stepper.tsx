@@ -13,7 +13,12 @@ interface StepperProps {
 
 export default function Stepper({ steps, currentStep }: StepperProps) {
   return (
-    <div className="flex items-center gap-0 mb-8">
+    <>
+    <div className="sm:hidden mb-5 rounded-xl bg-gray-100 p-3 dark:bg-gray-800" aria-label={`Step ${currentStep + 1} of ${steps.length}`}>
+      <div className="flex justify-between gap-3 text-sm font-medium"><span>Step {currentStep + 1} of {steps.length}</span><span>{steps[currentStep]?.label}</span></div>
+      <div className="h-1 mt-3 rounded bg-gray-300 dark:bg-gray-700"><div className="h-1 rounded bg-gray-900 dark:bg-white" style={{ width: `${((currentStep + 1) / steps.length) * 100}%` }} /></div>
+    </div>
+    <div className="hidden sm:flex items-center gap-0 mb-8">
       {steps.map((step, index) => {
         const isCompleted = index < currentStep;
         const isCurrent = index === currentStep;
@@ -55,5 +60,6 @@ export default function Stepper({ steps, currentStep }: StepperProps) {
         );
       })}
     </div>
+    </>
   );
 }

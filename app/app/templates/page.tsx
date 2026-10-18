@@ -78,7 +78,7 @@ export default function TemplatesPage() {
               />
             </div>
             <Button
-              className="w-full"
+              className="mobile-action-button w-full"
               onClick={generate}
               disabled={!business.trim() || !offer.trim() || !audience.trim() || loading}
             >
@@ -116,7 +116,7 @@ export default function TemplatesPage() {
                 <Button
                   variant="outline"
                   size="sm"
-                  className="w-full"
+                  className="mobile-action-button w-full"
                   onClick={() =>
                     copyTemplate(template.id, `Subject: ${template.subject}\n\n${template.body}`)
                   }
@@ -136,7 +136,7 @@ export default function TemplatesPage() {
           ))}
           <Button
             variant="outline"
-            className="w-full"
+            className="mobile-action-button w-full"
             onClick={() => {
               setStep(0);
               setTemplates([]);

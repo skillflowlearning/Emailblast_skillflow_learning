@@ -65,7 +65,7 @@ export default function SpamCheckPage() {
               />
             </div>
             <Button
-              className="w-full"
+              className="mobile-action-button w-full"
               onClick={analyze}
               disabled={!subject.trim() || !body.trim() || loading}
             >
@@ -150,7 +150,7 @@ export default function SpamCheckPage() {
 
           <Button
             variant="outline"
-            className="w-full"
+            className="mobile-action-button w-full"
             onClick={() => {
               setStep(0);
               setResult(null);

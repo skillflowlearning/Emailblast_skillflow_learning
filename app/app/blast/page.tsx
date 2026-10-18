@@ -801,7 +801,7 @@ export default function BlastPage() {
               </div>
             )}
 
-            <div className="flex justify-end pt-2">
+            <div className="mobile-action-bar flex justify-end pt-2">
               <Button
                 onClick={() => setStep(1)}
                 disabled={validRecipients.length === 0 || isOverMaxLimit}
@@ -925,7 +925,7 @@ export default function BlastPage() {
               </div>
             </div>
 
-            <div className="flex justify-between pt-2">
+            <div className="mobile-action-bar flex justify-between pt-2">
               <Button variant="outline" onClick={() => setStep(0)}>
                 <ChevronLeft className="w-4 h-4 mr-1" /> Back
               </Button>
@@ -1113,7 +1113,7 @@ export default function BlastPage() {
               </div>
             </div>
 
-            <div className="flex justify-between pt-2">
+            <div className="mobile-action-bar flex justify-between pt-2">
               <Button variant="outline" onClick={() => setStep(1)}>
                 <ChevronLeft className="w-4 h-4 mr-1" /> Back
               </Button>
@@ -1183,7 +1183,7 @@ export default function BlastPage() {
               </div>
             </div>
 
-            <div className="flex justify-between pt-2">
+            <div className="mobile-action-bar flex justify-between pt-2">
               <Button variant="outline" onClick={() => setStep(2)}>
                 <ChevronLeft className="w-4 h-4 mr-1" /> Back
               </Button>
@@ -1414,7 +1414,7 @@ export default function BlastPage() {
               </div>
             </div>
 
-            <div className="flex justify-between pt-2">
+            <div className="mobile-action-bar flex justify-between pt-2">
               <Button variant="outline" onClick={() => setStep(3)}>
                 <ChevronLeft className="w-4 h-4 mr-1" /> Back
               </Button>

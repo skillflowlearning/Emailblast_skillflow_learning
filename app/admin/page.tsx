@@ -284,10 +284,10 @@ export default function AdminPage() {
                     const isCriticalBounce = bRate > 3;
                     return (
                       <tr key={c.id} className="hover:bg-gray-50/50 dark:hover:bg-gray-800/30">
-                        <td className="py-4 pr-4 font-medium text-gray-900 dark:text-white">
+                        <td data-label="Campaign" className="py-4 pr-4 font-medium text-gray-900 dark:text-white">
                           {c.name}
                         </td>
-                        <td className="py-4 pr-4">
+                        <td data-label="Status" className="py-4 pr-4">
                           <Badge
                             variant={
                               c.status === 'active'
@@ -300,16 +300,16 @@ export default function AdminPage() {
                             {c.status}
                           </Badge>
                         </td>
-                        <td className="py-4 pr-4 text-right text-gray-700 dark:text-gray-300">
+                        <td data-label="Sent" className="py-4 pr-4 text-right text-gray-700 dark:text-gray-300">
                           {c.sent.toLocaleString()}
                         </td>
-                        <td className="py-4 pr-4 text-right text-gray-700 dark:text-gray-300">
+                        <td data-label="Delivered" className="py-4 pr-4 text-right text-gray-700 dark:text-gray-300">
                           {c.delivered.toLocaleString()}
                         </td>
-                        <td className="py-4 pr-4 text-right text-gray-700 dark:text-gray-300">
+                        <td data-label="Bounced" className="py-4 pr-4 text-right text-gray-700 dark:text-gray-300">
                           {c.bounced.toLocaleString()}
                         </td>
-                        <td className="py-4 pr-4 text-right font-medium">
+                        <td data-label="Bounce %" className="py-4 pr-4 text-right font-medium">
                           <span
                             className={
                               isCriticalBounce
@@ -320,16 +320,16 @@ export default function AdminPage() {
                             {bRate}%
                           </span>
                         </td>
-                        <td className="py-4 pr-4 text-right text-gray-700 dark:text-gray-300">
+                        <td data-label="Replied" className="py-4 pr-4 text-right text-gray-700 dark:text-gray-300">
                           {c.replied.toLocaleString()}
                         </td>
-                        <td className="py-4 pr-4 text-right text-gray-700 dark:text-gray-300">
+                        <td data-label="Unsub" className="py-4 pr-4 text-right text-gray-700 dark:text-gray-300">
                           {c.unsubscribed.toLocaleString()}
                         </td>
-                        <td className="py-4 pr-4 text-right text-gray-700 dark:text-gray-300">
+                        <td data-label="Complaint %" className="py-4 pr-4 text-right text-gray-700 dark:text-gray-300">
                           {calculateComplaintRate(c.complaints, c.sent)}
                         </td>
-                        <td className="py-4 text-right">
+                        <td data-label="Action" className="py-4 text-right">
                           {c.status !== 'completed' ? (
                             <Button
                               variant="outline"
@@ -409,28 +409,28 @@ export default function AdminPage() {
                     const isHighBounce = bRate > 3;
                     return (
                       <tr key={d.id} className="hover:bg-gray-50/50 dark:hover:bg-gray-800/30">
-                        <td className="py-4 pr-4 font-medium text-gray-900 dark:text-white flex items-center gap-2">
+                        <td data-label="Domain" className="py-4 pr-4 font-medium text-gray-900 dark:text-white flex items-center gap-2">
                           <Globe className="w-4 h-4 text-gray-400" />
                           {d.name}
                         </td>
-                        <td className="py-4 pr-4">
+                        <td data-label="Health" className="py-4 pr-4">
                           <HealthBadge health={d.health} />
                         </td>
-                        <td className="py-4 pr-4">
+                        <td data-label="Status" className="py-4 pr-4">
                           <Badge variant={d.status === 'active' ? 'success' : 'warning'}>
                             {d.status}
                           </Badge>
                         </td>
-                        <td className="py-4 pr-4 text-right text-gray-700 dark:text-gray-300">
+                        <td data-label="Sent" className="py-4 pr-4 text-right text-gray-700 dark:text-gray-300">
                           {d.sent.toLocaleString()}
                         </td>
-                        <td className="py-4 pr-4 text-right text-gray-700 dark:text-gray-300">
+                        <td data-label="Delivered" className="py-4 pr-4 text-right text-gray-700 dark:text-gray-300">
                           {d.delivered.toLocaleString()}
                         </td>
-                        <td className="py-4 pr-4 text-right text-gray-700 dark:text-gray-300">
+                        <td data-label="Bounced" className="py-4 pr-4 text-right text-gray-700 dark:text-gray-300">
                           {d.bounced.toLocaleString()}
                         </td>
-                        <td className="py-4 pr-4 text-right font-medium">
+                        <td data-label="Bounce %" className="py-4 pr-4 text-right font-medium">
                           <span
                             className={
                               isHighBounce
@@ -441,16 +441,16 @@ export default function AdminPage() {
                             {bRate}%
                           </span>
                         </td>
-                        <td className="py-4 pr-4 text-right text-gray-700 dark:text-gray-300">
+                        <td data-label="Replied" className="py-4 pr-4 text-right text-gray-700 dark:text-gray-300">
                           {d.replied.toLocaleString()}
                         </td>
-                        <td className="py-4 pr-4 text-right text-gray-700 dark:text-gray-300">
+                        <td data-label="Unsub" className="py-4 pr-4 text-right text-gray-700 dark:text-gray-300">
                           {d.unsubscribed.toLocaleString()}
                         </td>
-                        <td className="py-4 pr-4 text-right text-gray-700 dark:text-gray-300">
+                        <td data-label="Complaint %" className="py-4 pr-4 text-right text-gray-700 dark:text-gray-300">
                           {calculateComplaintRate(d.complaints, d.sent)}
                         </td>
-                        <td className="py-4 text-right">
+                        <td data-label="Action" className="py-4 text-right">
                           <Button
                             variant="outline"
                             size="sm"

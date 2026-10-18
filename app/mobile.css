@@ -1,0 +1,35 @@
+/* Layout-only mobile overrides; sending, settings and engine behavior are untouched. */
+.test-input { display: block; width: 100%; margin-top: .25rem; padding: .75rem; border: 1px solid #d1d5db; border-radius: .75rem; background: transparent; font: inherit; }
+.mobile-sidebar aside { width: 100%; min-height: 100dvh; }
+.mobile-sidebar nav a { min-height: 44px; }
+@media (max-width: 1023px) {
+  .app-shell, .app-content { width: 100%; max-width: 100%; }
+  .app-content { overflow-wrap: anywhere; }
+  .app-content :where(.flex) > * { min-width: 0; }
+  :where(input, textarea, select) { max-width: 100%; font-size: 16px !important; min-height: 44px; }
+  a:not([class]), a[class*="underline"] { display: inline-flex; align-items: center; min-height: 44px; }
+  :where(button, [role="button"], [role="checkbox"]) { min-height: 44px; min-width: 44px; }
+  input[type="checkbox"], input[type="radio"] { width: 24px; height: 24px; min-height: 24px; flex-shrink: 0; margin: 10px; }
+  .mobile-action-bar, .mobile-live-actions { position: fixed; left: 0; right: 0; bottom: 0; z-index: 30; padding: .75rem; padding-bottom: max(.75rem, env(safe-area-inset-bottom)); background: white; border-top: 1px solid #d1d5db; box-shadow: 0 -3px 18px #00000012; }
+  .dark .mobile-action-bar { background: #111827; }
+  .dark .mobile-live-actions { background: #111827; border-color: #374151; }
+  .mobile-action-button { position: sticky; bottom: max(.75rem, env(safe-area-inset-bottom)); z-index: 20; }
+}
+@media (max-width: 639px) {
+  body { margin: 0; }
+  .app-content .p-6 { padding: 1rem; }
+  .app-content .pt-0 { padding-top: 0; }
+  .app-content :where(.flex:not(.flex-col)) { flex-wrap: wrap; }
+  .app-content :where(.grid-cols-2) { grid-template-columns: minmax(0, 1fr); }
+  .app-content :where(.grid) > * { min-width: 0; }
+  .app-content pre { white-space: pre-wrap; overflow-wrap: anywhere; }
+  .app-content h1 { font-size: 1.75rem; line-height: 1.2; }
+  .app-content table, .app-content tbody, .app-content tr { display: block; width: 100%; }
+  .app-content thead { display: none; }
+  .app-content tbody tr { margin-bottom: 1rem; padding: .75rem; border: 1px solid #d1d5db; border-radius: .75rem; }
+  .dark .app-content tbody tr { border-color: #374151; }
+  .app-content td { display: grid !important; grid-template-columns: minmax(90px, .8fr) minmax(0, 1fr); gap: .75rem; text-align: left; padding: .5rem 0 !important; overflow-wrap: anywhere; }
+  .app-content td::before { content: attr(data-label); font-size: .875rem; color: #6b7280; }
+  .dark .app-content td::before { color: #9ca3af; }
+  .app-content .overflow-x-auto { overflow-x: visible; }
+}
